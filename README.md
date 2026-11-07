@@ -4,6 +4,9 @@ An OpenAI-compatible inference server for DeepSeek-V4.1-Flash-1017 on one DGX St
 plus the station's RTX PRO 6000 for the experts that do not fit in HBM), built on vLLM 0.32 and the ds41 kernels.
 Thinking, tool calls, DSpark speculative decoding and contexts up to 1M tokens are supported.
 
+This engine is mostly a port of original-el8's work: [deepseek-v4.1-flash in
+original-el8/dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash).
+
 The default profile is lossless. It runs at the official precision (FP4 experts, FP8 and BF16 elsewhere), and its
 logits match the official inference code on the same weights, with KLD at the run-to-run noise floor. Lossy options
 are separate profiles. Each one lists the speed it buys and the KLD it adds against that reference.
@@ -94,5 +97,7 @@ the default.
 
 ## Credits
 
+Most of this engine is a port of original-el8's DeepSeek-V4.1-Flash work for the DGX Station GB300
+([original-el8/dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash)).
 The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT; see its `LICENSE`, `NOTICE` and
 `THIRD_PARTY.md`). This engine is built on vLLM (Apache-2.0) and uses b12x (Apache-2.0) in the sidecar.

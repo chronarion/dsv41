@@ -76,6 +76,13 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_on = os.environ.get("DSV41_WHOLE_STEP", "1") == "1"
         self._ws_maxk = int(os.environ.get("DSV41_WS_MAXK", "1000000"))
         self._ws_dbg = os.environ.get("DSV41_WS_DEBUG") == "1"
+        # every whole-step graph keeps its own memory pool (~0.5 GB at batch 32), outside the budget vLLM sized the KV
+        # cache with: capture only while this much device memory is still free, else the key runs on the stock path
+        # stock steps at high concurrency need several GB beyond vLLM's profile too (a 32-request overload took the last
+        # 3 GB after the graphs stopped): keep 8 GB, and no graphs above 16 requests per step
+        self._ws_min_free = int(os.environ.get("DSV41_WS_MIN_FREE_MIB", "8192")) << 20
+        self._ws_max_batch = int(os.environ.get("DSV41_WS_MAX_BATCH", "16"))
+        self._ws_room_logged = False
         # K3 measurement: DSV41_CONF_LOG=path logs, per batch-1 replay, the verified draft width, the
         # tokens the step emitted and the max draft probability of each drafted position (the drafts the next step
         # verifies); a pinned ring, written out at each 30-s log. Off by default (it adds a softmax per step).
@@ -187,6 +194,8 @@ class WholeStepRunner(GPUModelRunner):
         K = len(spec[reqs[0]])
         if K == 0 or any(len(spec[r]) != K or so.num_scheduled_tokens[r] != K + 1 for r in reqs):
             return self._no("non-uniform drafts")
+        if len(reqs) > self._ws_max_batch:   # DSV41_WS_MAX_BATCH: vLLM's own graphs (inside its memory budget) above
+            return self._no("batch above DSV41_WS_MAX_BATCH")
         if K > self._ws_maxk:   # DSV41_WS_MAXK: wider steps (suffix's 32-row verify) take the stock path
             return self._no(f"K={K} above DSV41_WS_MAXK")
         rs = self.req_states
@@ -538,7 +547,24 @@ class WholeStepRunner(GPUModelRunner):
                 except Exception as e:
                     _LOG(f"Mega Gate warm-up for E={E} failed: {e!r}")
 
+    def _ws_room(self, key):
+        """True while a new graph fits: capturing with the device nearly full failed mid-capture and the next stock step
+        ran out of memory (32 concurrent requests, 27 graphs holding 13 GB, 2026-11-11)"""
+        free, _ = torch.cuda.mem_get_info()
+        if free >= self._ws_min_free:
+            return True
+        if not self._ws_room_logged:
+            self._ws_room_logged = True
+            _LOG(f"{free >> 20} MiB free, below DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20}: no more graphs are "
+                 f"captured ({len(self._ws_graphs)} held); new keys such as {key} run on the stock path")
+        return False
+
     def _ws_capture(self, key, so):
+        if not self._ws_room(key):
+            self._no("no memory for another graph")
+            self._ws_streak = 0
+            self._ws_counts["stock"] += 1
+            return super().execute_model(so)
         self._k3b_fast = False   # the record step's drafter advances the width word outside the replay count
         self._ws_streak = 0
         # dsv41 C19: the boundary's lossy routing options (DSV41_DROP_DECODE_ONLY) apply only while a decode graph is
@@ -576,6 +602,7 @@ class WholeStepRunner(GPUModelRunner):
         steady = steady_scheduler_output(so, self)
         t0 = time.time()
         torch.cuda.synchronize()
+        free0 = torch.cuda.mem_get_info()[0]
         self._ws_retired.clear()     # the GPU is idle here: no retired graph can still be running
         with graph_capture(device=self.device):
             s = current_stream()
@@ -619,7 +646,9 @@ class WholeStepRunner(GPUModelRunner):
                 failed = True
         if failed:
             from vllm.v1.worker.gpu.model_runner import AsyncOutput
+            del graph                    # its private pool goes back to the caching allocator, then to the device
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             self._ws_eager_out = AsyncOutput(model_runner_output=rec.model_runner_output,
                                              sampler_output=rec.sampler_output,
                                              num_sampled_tokens=rec.num_sampled_tokens, main_stream=self.main_stream,
@@ -642,5 +671,6 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_graphs[key] = g
         self._ws_counts["capture"] += 1
         self._ws_eager_out = out
-        _LOG(f"captured {key} in {time.time() - t0:.2f} s")
+        _LOG(f"captured {key} in {time.time() - t0:.2f} s; device free {free0 >> 20} -> "
+             f"{torch.cuda.mem_get_info()[0] >> 20} MiB, {len(self._ws_graphs)} graphs")
         return None

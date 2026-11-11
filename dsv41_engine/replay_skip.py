@@ -44,8 +44,13 @@ def trim_unread(state, input_batch, num_reqs, query_lens, kept_lens, window):
         return kept_lens
     kept = kept_lens.copy()
     kept[skip] = 0
-    if int(kept.sum()) == 0 and getattr(state.decoder_replay_layers, "_dsv41_out_meta", None) is None:
-        kept[int(np.flatnonzero(skip)[0])] = 1  # no recorded output shapes yet: keep one row this once
+    if int(kept.sum()) > 0 or getattr(state.decoder_replay_layers, "_dsv41_out_meta", None) is None:
+        # The replay batch runs (another request keeps rows, or no output shapes are recorded yet): give each skipped
+        # request one row, never zero. A zero-row request sorts first as a "decode" in vLLM's metadata split, and when
+        # no real decode follows, the indexer gets num_decodes > 0 with zero decode tokens and divides by zero
+        # (sparse_attn_indexer: num_decode_tokens % decode_lens.shape[0]): several long prompts prefilling at once.
+        # One row is the shape vLLM itself produces for a 1-token final chunk; its replay output is unread.
+        kept[skip] = 1
     STATS["skipped"] += int(skip.sum())
     STATS["steps"] += 1
     if STATS["steps"] >= 2 * max(1, STATS["logged"]):

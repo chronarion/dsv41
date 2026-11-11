@@ -1,4 +1,4 @@
-# vLLM 0.32 sampling patches (mounted over the image's files by `dsv41.sh`)
+# vLLM 0.32 patches (mounted over the image's files by `dsv41.sh`)
 
 Backport of vLLM #61161 ("Avoid reusing random draws across block verification rounds", merged 2026-10-15, after
 0.32): block verification and DSpark's drafting noise take a per-draft-step seed, `spec_step_seed(seed, i) = seed ^
@@ -13,3 +13,7 @@ measured here with the PR's multi-round test: P = 0.419 for a target of 0.5 at t
 
 Both are the image's files (md5 06738070... / 9ef4edc4...) plus the hunks marked `dsv41 C1`. ds41's fused Markov loop
 (`kernels/vendor/ds41/w6-moe/markov/w6mk.cu`) and W5 loop (`fastpath/w5_markov.py`) carry the same step seed.
+
+`deepseek_v41_encoding.py` (`vllm/tokenizers/deepseek_v41_encoding.py`, the image's file plus the hunk marked `dsv41 A1`):
+`reasoning_effort` also accepts OpenAI's `minimal` (low's budget, 50) and `medium` (62, halfway between low and high).
+vLLM 0.32 accepted only low / high / xhigh / max and an integer, so agent clients that send `medium` got HTTP 400.

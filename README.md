@@ -28,7 +28,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
 | `dsv41.sh` | launcher: the RTX sidecar, then the server; `profiles/*.env` select the options |
 | `harness/` | the captured-step harness and the decode-path KLD tool used for every measurement |
-| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), top-p inside batch-2 graphs (`topp_check.py`) |
+| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`) |
 
 ## Requirements
 
@@ -71,7 +71,28 @@ Release check of both profiles (2026-11-06): QA 6/6; tool calls 2/2 with thinkin
 195 at T=1, `fast` 194 / 193, stock vLLM 0.32 on the same questions 195 / 196.
 
 Request options: temperature, top_p, top_k, seed, stop, max_tokens, min_tokens, n, logprobs, penalties, JSON schema,
-streaming and thinking all work, also mixed in one batch. vLLM refuses `min_p` and `logit_bias` with speculative decoding.
+streaming and thinking all work, also mixed in one batch. `reasoning_effort` takes none, minimal, low, medium, high,
+xhigh or max (or 1-100); medium sits halfway between low and high. vLLM refuses `min_p` and `logit_bias` with
+speculative decoding.
+
+Agent traffic and load (default profile, 2026-11-11):
+
+- [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
+  standard/1): prefill 52.0K tok/s at 32K and 51.0K at 128K; decode tok/s:
+
+  | context | 1 request | 8 requests | 16 requests |
+  |---|---:|---:|---:|
+  | 0 | 361 | 1,300 agg | 1,878 agg |
+  | 64K | 345 | 1,288 agg | 1,820 agg |
+  | 128K | 344 | 1,222 agg | 1,755 agg |
+
+- Its seven scheduler tests: six pass (arrivals, burst with 64 prompts of 30K tokens at once, agents with 8 agents in
+  40-100K-token conversations for 10 minutes, short-under-long, abort-storm, soak-mix). In overload, an open queue at
+  twice the server's capacity (about 1,000 requests waiting), the server stays healthy and drains, but 58 of 2,096
+  requests failed on the client side while ~1,000 were in flight.
+- An agent stress test (`bench/agent_stress.py`): 12 coding agents with streamed tool calls, real file contents as tool
+  results, contexts up to 200K tokens, mixed sampling settings and aborted streams; 2,904 turns in 20 minutes with no
+  server error, hang or broken output.
 
 Decode KLD is against the official inference code on the same weights. The official code's own batch-size dependence is
 ~0.028 (its batch-2 against its batch-16 runs), so the default sits at the noise floor.

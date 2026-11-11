@@ -59,6 +59,7 @@ main() {
     -v $STATE/peer3-build:/peer3-build -v $E:/engine:ro -e PYTHONPATH=/engine \
     -v $E/patches/vllm/gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/sample/gumbel.py:ro \
     -v $E/patches/vllm/rejection_sampler_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:ro \
+    -v $E/patches/vllm/deepseek_v41_encoding.py:/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v41_encoding.py:ro \
     $(env | grep -o "^DSV41_[A-Z0-9_]*" | sed "s/^/-e /" | tr "\n" " ") \
     -v $RUNTIME/hook:/w:ro -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro \

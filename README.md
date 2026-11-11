@@ -75,24 +75,6 @@ streaming and thinking all work, also mixed in one batch. `reasoning_effort` tak
 xhigh or max (or 1-100); medium sits halfway between low and high. vLLM refuses `min_p` and `logit_bias` with
 speculative decoding.
 
-Agent traffic and load (default profile, 2026-11-11):
-
-- [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
-  standard/1): prefill 52.0K tok/s at 32K and 51.0K at 128K; decode tok/s:
-
-  | context | 1 request | 8 requests | 16 requests |
-  |---|---:|---:|---:|
-  | 0 | 361 | 1,300 agg | 1,878 agg |
-  | 64K | 345 | 1,288 agg | 1,820 agg |
-  | 128K | 344 | 1,222 agg | 1,755 agg |
-
-- Its seven scheduler tests: six pass (arrivals, burst with 64 prompts of 30K tokens at once, agents with 8 agents in
-  40-100K-token conversations for 10 minutes, short-under-long, abort-storm, soak-mix). In overload, an open queue at
-  twice the server's capacity (about 1,000 requests waiting), the server stays healthy and drains, but 58 of 2,096
-  requests failed on the client side while ~1,000 were in flight.
-- An agent stress test (`bench/agent_stress.py`): 12 coding agents with streamed tool calls, real file contents as tool
-  results, contexts up to 200K tokens, mixed sampling settings and aborted streams; 2,904 turns in 20 minutes with no
-  server error, hang or broken output.
 
 Decode KLD is against the official inference code on the same weights. The official code's own batch-size dependence is
 ~0.028 (its batch-2 against its batch-16 runs), so the default sits at the noise floor.
@@ -116,9 +98,46 @@ allocation for a 76-300 W add-in card), and sustained MoE runs at about 1.2 GHz.
 prompts by 13% and leave the others about flat, but halve the KV capacity (2.15M tokens instead of 4.24M), so they are not
 the default.
 
+## Local Inference Lab benchmark
+
+[Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
+standard/1), default profile, run inside the server container with
+`python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
+one GPU serves the API). Measured 2026-11-11 on the release code.
+
+| | 1 request | 8 requests (agg) | 16 requests (agg) |
+|---|---:|---:|---:|
+| context 0 | 367 | 1,277 | 1,884 |
+| context 64K | 356 | 1,258 | 1,797 |
+| context 128K | 335 | 1,229 | 1,812 |
+
+Prefill: 53,333 tok/s on a 32K prompt (time to first token 0.61 s), 52,918 tok/s on 128K (2.43 s). The GPU ran
+at its power cap during prefill, as in every prefill number here.
+
+Its scheduler tests (`--scheduler all`), which exercise admission, mixed prefill and decode, aborts and overload from the
+client side: burst (64 prompts of 30K tokens at once), agents (8
+agents in 40-100K-token conversations for 10 minutes), arrivals, short-under-long, abort-storm and soak-mix pass. In
+overload, an open queue at twice the server's capacity with about 1,000 requests waiting, the server stays healthy, logs no
+error and drains, but the benchmark counts client-side failures while ~1,000 requests are in flight (58 to 180 of about
+2,100 across runs), so that test reports FAIL. (burst, agents and overload were run on the release code; the other four on
+the same day's build before the issue #1-#3 fixes.)
+
+## Agent traffic
+
+`bench/agent_stress.py` runs simulated coding agents against the server: streamed tool calls with a 30-tool list, real file
+contents as tool results, contexts that grow past 200K tokens and are re-read from the prefix cache every turn, mixed
+sampling settings and `reasoning_effort` values, structured-output turns, and streams the client abandons midway.
+`bench/burst_check.py` sends 16 unique 30K-token prompts at once. On the release code: 12 agents for 8 minutes, 1,418 turns, contexts up
+to 144K tokens, 55 abandoned streams, no server error, hang or broken output; the burst check 16 of 16 correct. Before the
+fixes in this release, several long prompts arriving together crashed the server, and so did more than about 20
+concurrent requests.
+
 ## Credits
 
 Most of this engine is a port of original-el8's DeepSeek-V4.1-Flash work for the DGX Station GB300
 ([original-el8/dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash)).
 The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT; see its `LICENSE`, `NOTICE` and
 `THIRD_PARTY.md`). This engine is built on vLLM (Apache-2.0) and uses b12x (Apache-2.0) in the sidecar.
+
+The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#4), including their
+root-cause analysis and proposed patches. The load and agent tests use Local Inference Lab's llm-inference-bench.

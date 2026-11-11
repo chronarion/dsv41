@@ -38,6 +38,7 @@ def _get_kernel():
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         ok = cols < D
         row = tl.load(ids_ptr + i).to(tl.int64)
+        row = tl.where(row < 0, 0, row)   # dsv41: vLLM's -1 draft placeholders (rows the verifier never reads)
         v = tl.load(w_ptr + row * w_stride + cols, mask=ok)
         tl.store(o_ptr + i.to(tl.int64) * o_stride + cols, v, mask=ok)
 
@@ -81,7 +82,7 @@ def make_get_inputs_embeds(orig):
 
         n = input_ids.shape[0]
         if mm_embeds or n == 0 or n > self.inputs_embeds.shape[0] or input_ids.dim() != 1:
-            return orig(self, input_ids, mm_embeds, is_mm_embed)
+            return orig(self, input_ids.clamp_min(0) if input_ids.numel() else input_ids, mm_embeds, is_mm_embed)
         state = self.__dict__.get("_w5_embed")
         if state is None:
             state = resolve_embedding(self)

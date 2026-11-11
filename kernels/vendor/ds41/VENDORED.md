@@ -145,3 +145,7 @@ reference-class gates, with changes noted per file.
   `conf_width.py` names take its row mask as the router's padding (rows beyond a request's width route to no expert, hot or
   cold); `router_mega.cu` skips the padded rows' cold picks as `router.cu` does. `DSV41_ROUTER_MEGA_MAX_T` bounds the W4
   router at T > 16 (default 64): the masked rows need it at T 18 and 24, while the 32-row copy verify is faster on the stock path.
+- Draft placeholders (2026-11-11, chronarion/dsv41#1): `fastpath_tail_embed.py` gathers row 0 for a negative token id, in
+  the Triton gather and in the stock fallback. When a batch shrinks (2 requests drafting 5 to 1 request scheduled for 7),
+  vLLM's `-1` draft placeholders reach `input_ids`; the verifier stops at them, but the gather read `weight[-1]`, 10 KB
+  before the table (an MMU fault, Xid 31, on driver 620). Outputs unchanged.

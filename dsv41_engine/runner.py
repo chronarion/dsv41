@@ -78,10 +78,17 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_dbg = os.environ.get("DSV41_WS_DEBUG") == "1"
         # every whole-step graph keeps its own memory pool (~0.5 GB at batch 32), outside the budget vLLM sized the KV
         # cache with: capture only while this much device memory is still free, else the key runs on the stock path
-        # stock steps at high concurrency need several GB beyond vLLM's profile too (a 32-request overload took the last
-        # 3 GB after the graphs stopped): keep 8 GB, and no graphs above 16 requests per step
-        self._ws_min_free = int(os.environ.get("DSV41_WS_MIN_FREE_MIB", "8192")) << 20
-        self._ws_max_batch = int(os.environ.get("DSV41_WS_MAX_BATCH", "16"))
+        # Whole-step graphs live outside the memory budget vLLM sized the KV cache with, and their number follows what
+        # clients send (batch x width x sampler branch). Bounded three ways (chronarion/dsv41#2): one shared pool for all
+        # of them (they replay one per step in stream order and keep their outputs referenced, so a later capture reuses
+        # dead intermediates: ~0.2 GB per graph instead of ~0.5), a budget for that pool (batch-1 keys exempt: K3b keeps
+        # its whole width set) plus a free-memory floor, and no graphs above batch 8, where vLLM's boot-time graphs serve
+        # (the whole-step gain is host overhead, which matters at small batches; C16 measured no slower without it)
+        self._ws_pool = None
+        self._ws_pool_bytes = 0
+        self._ws_pool_budget = int(float(os.environ.get("DSV41_WS_POOL_GB", "6")) * (1 << 30))
+        self._ws_min_free = int(os.environ.get("DSV41_WS_MIN_FREE_MIB", "4096")) << 20
+        self._ws_max_batch = int(os.environ.get("DSV41_WS_MAX_BATCH", "8"))
         self._ws_room_logged = False
         # K3 measurement: DSV41_CONF_LOG=path logs, per batch-1 replay, the verified draft width, the
         # tokens the step emitted and the max draft probability of each drafted position (the drafts the next step
@@ -508,6 +515,12 @@ class WholeStepRunner(GPUModelRunner):
         new copy into the same destination is ordered after the previous one, so reusing its staging buffer would
         race only if the host rewrote it before the earlier copy ran: each destination gets a pair, alternated)"""
         pair = self._ws_pin.get(key)
+        if pair is not None and (pair[0].shape != dst.shape or pair[0].dtype != dst.dtype):
+            for j in (0, 1):             # an id() reused by another graph's tensor (#3): wait for the old copies
+                ev = self._ws_ev.pop(key + (j,), None)
+                if ev is not None:
+                    ev.synchronize()
+            pair = None
         if pair is None:
             pair = [torch.empty(dst.shape, dtype=dst.dtype, pin_memory=True) for _ in range(2)] + [0]
             self._ws_pin[key] = pair
@@ -549,18 +562,33 @@ class WholeStepRunner(GPUModelRunner):
 
     def _ws_room(self, key):
         """True while a new graph fits: capturing with the device nearly full failed mid-capture and the next stock step
-        ran out of memory (32 concurrent requests, 27 graphs holding 13 GB, 2026-11-11)"""
+        ran out of memory (32 concurrent requests, 27 private-pool graphs holding 13 GB, 2026-11-11)"""
         free, _ = torch.cuda.mem_get_info()
-        if free >= self._ws_min_free:
+        why = None
+        if free < self._ws_min_free:
+            why = f"{free >> 20} MiB free, below DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20}"
+        elif key[0] > 1 and self._ws_pool_bytes >= self._ws_pool_budget:
+            why = f"the graph pool holds ~{self._ws_pool_bytes >> 20} MiB, DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}"
+        if why is None:
             return True
         if not self._ws_room_logged:
             self._ws_room_logged = True
-            _LOG(f"{free >> 20} MiB free, below DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20}: no more graphs are "
-                 f"captured ({len(self._ws_graphs)} held); new keys such as {key} run on the stock path")
+            _LOG(f"{why}: no more graphs are captured ({len(self._ws_graphs)} held); new keys such as {key} stay on the "
+                 f"stock path")
         return False
+
+    def _ws_forget(self, g):
+        """drop a freed graph's staging buffers: keyed by id(), a later graph's tensor could inherit them (#3)"""
+        for t in g.patches.h2d:
+            self._ws_pin.pop(("c", id(t)), None)
+            for j in (0, 1):
+                ev = self._ws_ev.pop(("c", id(t), j), None)
+                if ev is not None:
+                    ev.synchronize()
 
     def _ws_capture(self, key, so):
         if not self._ws_room(key):
+            self._ws_failed.add(key)     # stays on the stock path
             self._no("no memory for another graph")
             self._ws_streak = 0
             self._ws_counts["stock"] += 1
@@ -603,7 +631,9 @@ class WholeStepRunner(GPUModelRunner):
         t0 = time.time()
         torch.cuda.synchronize()
         free0 = torch.cuda.mem_get_info()[0]
-        self._ws_retired.clear()     # the GPU is idle here: no retired graph can still be running
+        for old in self._ws_retired:   # the GPU is idle here: no retired graph can still be running
+            self._ws_forget(old)
+        self._ws_retired.clear()
         with graph_capture(device=self.device):
             s = current_stream()
             # this step for real, through the capturable path, on the capture stream (real async output)
@@ -636,7 +666,9 @@ class WholeStepRunner(GPUModelRunner):
             graph = torch.cuda.CUDAGraph()
             failed = False
             try:
-                with g.patches.active("replay"), torch.cuda.graph(graph, stream=s):
+                if self._ws_pool is None:
+                    self._ws_pool = torch.cuda.graph_pool_handle()
+                with g.patches.active("replay"), torch.cuda.graph(graph, stream=s, pool=self._ws_pool):
                     super().execute_model(steady)
                     ao = super().sample_tokens(None)
             except Exception as e:   # the step above already ran for real: serve its output, keep this key stock
@@ -671,6 +703,8 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_graphs[key] = g
         self._ws_counts["capture"] += 1
         self._ws_eager_out = out
-        _LOG(f"captured {key} in {time.time() - t0:.2f} s; device free {free0 >> 20} -> "
-             f"{torch.cuda.mem_get_info()[0] >> 20} MiB, {len(self._ws_graphs)} graphs")
+        free1 = torch.cuda.mem_get_info()[0]
+        self._ws_pool_bytes += max(0, free0 - free1)
+        _LOG(f"captured {key} in {time.time() - t0:.2f} s; device free {free0 >> 20} -> {free1 >> 20} MiB, "
+             f"{len(self._ws_graphs)} graphs, pool ~{self._ws_pool_bytes >> 20} MiB")
         return None

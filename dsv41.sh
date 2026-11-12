@@ -62,6 +62,7 @@ main() {
     -v $E/patches/vllm/deepseek_v41_encoding.py:/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v41_encoding.py:ro \
     -v $E/patches/vllm/sampling_params.py:/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py:ro \
     -v $E/patches/vllm/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v41.py:ro \
+    -v $E/patches/vllm/detokenizer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/detokenizer.py:ro \
     $(env | grep -o "^DSV41_[A-Z0-9_]*" | sed "s/^/-e /" | tr "\n" " ") \
     -v $RUNTIME/hook:/w:ro -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro \

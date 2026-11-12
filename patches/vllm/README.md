@@ -33,3 +33,8 @@ no added token strips whitespace, so the ids equal one `encode` of the whole pro
 renderer's call arguments. The encoder keeps its own Rust tokenizer: HF's `__call__` leaves truncation set on the shared
 one. Requests with `truncate_prompt_tokens` or other arguments take the stock call.
 
+`detokenizer.py` (`vllm/v1/engine/detokenizer.py`, the image's file plus the hunk marked `dsv41 A4`): the incremental
+detokenizer's decode stream is primed with the prompt's last 64 tokens instead of all of them. Its first step decoded
+everything it was primed with (46 ms at 157K tokens) on the API server's output loop, which serves every stream; the
+generated text is the same (checked on 1,672 prompt / continuation pairs, `skip_special_tokens` on and off).
+

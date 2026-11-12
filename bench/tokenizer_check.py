@@ -1,4 +1,5 @@
-"""The chat-path tokenizer patch (patches/vllm/deepseek_v41.py, dsv41 A3) against the stock tokenizer: the same ids on
+"""The chat-path tokenizer patch (patches/vllm/deepseek_v41.py, dsv41 A3) against the stock tokenizer, and the detokenizer's
+short priming (patches/vllm/detokenizer.py, dsv41 A4): the same ids on
 source code, prose, CJK, random Unicode, special-token spellings and JSON, at forced small chunk sizes, cached and not,
 and through the renderer's call (truncation / max_length / add_special_tokens). Run inside the server container:
    docker cp bench/tokenizer_check.py dsv41:/tmp/ && docker exec dsv41 python3 /tmp/tokenizer_check.py"""
@@ -36,4 +37,22 @@ for t in texts[:300]:
     for kw in calls:
         bad += wrapped(t, **kw)["input_ids"] != base(t, **kw)["input_ids"]
 print(f"tokenizer check: {len(texts)} texts x 3 chunk sizes x 2 passes + 300 x {len(calls)} calls: {bad} mismatches")
-raise SystemExit(1 if bad else 0)
+# the detokenizer patch (patches/vllm/detokenizer.py, dsv41 A4): a decode stream primed with the prompt's last 64 tokens
+# yields the same text as one primed with the whole prompt
+import tokenizers  # noqa: E402
+T = base._tokenizer
+dbad = cases = 0
+for i in range(600):
+    t0 = rng.choice(texts)
+    a = rng.randint(0, max(1, len(t0) - 400))
+    p = T.encode(t0[a:a + rng.randint(50, 3000)], add_special_tokens=False).ids
+    if len(p) < 3:
+        continue
+    cut = rng.randint(1, len(p) - 1)
+    for skip in (True, False):
+        full = tokenizers.decoders.DecodeStream(ids=p[:cut], skip_special_tokens=skip)
+        tail = tokenizers.decoders.DecodeStream(ids=p[:cut][-64:], skip_special_tokens=skip)
+        cases += 1
+        dbad += [full.step(T, x) for x in p[cut:cut + 40]] != [tail.step(T, x) for x in p[cut:cut + 40]]
+print(f"detokenizer check: {cases} prompt / continuation pairs: {dbad} mismatches")
+raise SystemExit(1 if bad or dbad else 0)

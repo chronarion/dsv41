@@ -105,18 +105,20 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-12 on the release code (1.5).
+one GPU serves the API). Measured 2026-11-12 on the release code (1.6).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 364 | 1,337 | 1,953 |
-| context 64K | 355 | 1,318 | 1,849 |
-| context 128K | 364 | 1,314 | 1,858 |
+| context 0 | 376 | 1,346 | 1,945 |
+| context 64K | 371 | 1,324 | 1,844 |
+| context 128K | 360 | 1,283 | 1,856 |
 
-Prefill: 63,519 tok/s on a 32K prompt (time to first token 0.51 s), 64,255 tok/s on 128K (2.00 s). The GPU ran
+Prefill: 65,579 tok/s on a 32K prompt (time to first token 0.49 s), 65,470 tok/s on 128K (1.96 s). The GPU ran
 at its power cap during prefill, as in every prefill number here. 1.5 moved the cold experts that prefill computes on
 the GB300 to the layers that prefill runs in full (+11-12%; the RTX was holding the GB300 up on this text), and stopped
-capping per-request draft widths at batches 7-8, where the cap saved no work (8 requests +4-6%).
+capping per-request draft widths at batches 7-8, where the cap saved no work (8 requests +4-6%). 1.6 stopped the
+output detokenizer from decoding the whole prompt before a request's first token (46 ms at 128K): +2-3% prefill, and a
+repeated 128K prompt answers in 0.06 s.
 
 The benchmark restarts each stream with the same long prompt, so at 64K-128K part of what it measures is how fast the
 server turns the chat request back into tokens. 1.3 tokenizes chat prompts in pieces split at the template's special

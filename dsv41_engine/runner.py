@@ -142,6 +142,9 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_t = time.time()
         self._ws_counts = {"stock": 0, "replay": 0, "capture": 0}
         self._ws_why: dict = {}            # why steps went to the stock path
+        self._ws_last_why = "off"          # the reason of the latest stock step, and its timing (#9: host time from
+        self._ws_stock_open = None         # execute_model to the end of sample_tokens, GPU span between two events,
+        self._ws_stock_t: list = []        # per reason and row bucket, in the 30-s step-stats line)
         self._ws_tl = self._ws_tl_new()
         self._ws_pin = {}                  # pinned staging buffers for the refresh copies
         self._ws_ev = {}                   # the event after each staging buffer's last copy
@@ -216,7 +219,34 @@ class WholeStepRunner(GPUModelRunner):
     # ---------------------------------------------------------------------------------------------- eligibility
     def _no(self, why):
         self._ws_why[why] = self._ws_why.get(why, 0) + 1
+        self._ws_last_why = why
         return None
+
+    def _ws_stock_begin(self, so):
+        rows = getattr(so, "total_num_scheduled_tokens", 0)
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._ws_stock_open = (f"{self._ws_last_why} {'<=256' if rows <= 256 else '>256'}", ev, time.perf_counter())
+
+    def _ws_stock_end(self):
+        tag, ev0, t0 = self._ws_stock_open
+        self._ws_stock_open = None
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev1.record()
+        if len(self._ws_stock_t) < 20000:
+            self._ws_stock_t.append((tag, ev0, ev1, time.perf_counter() - t0))
+
+    def _ws_stock_summary(self):
+        """per reason and row bucket: steps, median host ms (execute_model to sampled), median GPU span ms"""
+        done, keep, per = [], [], {}
+        for r in self._ws_stock_t:
+            (done if r[2].query() else keep).append(r)
+        self._ws_stock_t = keep
+        for tag, a, b, h in done:
+            per.setdefault(tag, []).append((h * 1e3, a.elapsed_time(b)))
+        med = lambda v: sorted(v)[len(v) // 2]
+        return "; ".join(f"{t}: {len(v)} steps, host {med([x[0] for x in v]):.1f} ms, GPU {med([x[1] for x in v]):.1f} ms"
+                         for t, v in sorted(per.items()))
 
     def _ws_kv_why(self, m):
         """why a step with this KV connector metadata takes the stock path, or None when it may replay. A load stays
@@ -309,7 +339,15 @@ class WholeStepRunner(GPUModelRunner):
         if key is None:
             self._ws_streak = 0
             self._ws_counts["stock"] += 1
-            return super().execute_model(scheduler_output, intermediate_tensors, dummy_run, *args, **kwargs)
+            if dummy_run:
+                return super().execute_model(scheduler_output, intermediate_tensors, dummy_run, *args, **kwargs)
+            if not self._ws_on:
+                self._ws_last_why = "off"
+            self._ws_stock_begin(scheduler_output)
+            out = super().execute_model(scheduler_output, intermediate_tensors, dummy_run, *args, **kwargs)
+            if out is not None:   # no sampling follows (empty step, no forward)
+                self._ws_stock_end()
+            return out
         if self._k3b and key[0] == 1 and key[1] == self._k3b_k:
             return self._k3b_step(key, scheduler_output)
         if self._ws_usable(key) is None:
@@ -471,6 +509,9 @@ class WholeStepRunner(GPUModelRunner):
                  f"refresh copies {tl['copies']}; stock reasons {self._ws_why}; graphs {sorted(self._ws_graphs)}")
             if keys_s:
                 _LOG(f"GPU period median per (batch x draft width): {keys_s}")
+            st = self._ws_stock_summary()
+            if st:
+                _LOG(f"stock steps since the last line (reason, rows): {st}")
             if self._k3b:
                 nk = max(sum(self._k3b_hist), 1)
                 _LOG(f"K3b widths 1..{self._k3b_k}: {self._k3b_hist[1:]} (mean "
@@ -527,7 +568,10 @@ class WholeStepRunner(GPUModelRunner):
             out, self._ws_eager_out = self._ws_eager_out, None
             return out
         if self._ws_pending is None:
-            return super().sample_tokens(grammar_output)
+            out = super().sample_tokens(grammar_output)
+            if self._ws_stock_open is not None:
+                self._ws_stock_end()
+            return out
         g, req_ids, K = self._ws_pending
         self._ws_pending = None
         from vllm.v1.outputs import ModelRunnerOutput

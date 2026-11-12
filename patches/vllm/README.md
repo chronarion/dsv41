@@ -24,3 +24,12 @@ runner V4.1 uses applies both to every verified position before rejection sampli
 top-k, top-p, `min_tokens` and `allowed_token_ids` there, so the output keeps the requested distribution.
 `bench/api_check.py` checks it: a +100 bias holds at every position, `min_p` 0.999 at temperature 1 equals greedy, and
 no sampled token falls below `min_p`'s bound.
+
+`deepseek_v41.py` (`vllm/tokenizers/deepseek_v41.py`, the image's file plus the hunk marked `dsv41 A3`): the chat path
+tokenizes the rendered prompt one special-token-delimited piece at a time, with an LRU cache of pieces (8M tokens),
+and encodes a long new piece as parallel chunks (`encode_batch`), cut only where no pre-tokenizer pattern can span the
+cut (a space between two ASCII letters, or a newline before an ASCII letter). The tokenizer has an empty normalizer and
+no added token strips whitespace, so the ids equal one `encode` of the whole prompt; checked on ~1,400 texts and the
+renderer's call arguments. The encoder keeps its own Rust tokenizer: HF's `__call__` leaves truncation set on the shared
+one. Requests with `truncate_prompt_tokens` or other arguments take the stock call.
+

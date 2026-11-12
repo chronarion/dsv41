@@ -28,7 +28,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
 | `dsv41.sh` | launcher: the RTX sidecar, then the server; `profiles/*.env` select the options |
 | `harness/` | the captured-step harness and the decode-path KLD tool used for every measurement |
-| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`) |
+| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), the chat tokenizer patch (`tokenizer_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`) |
 
 ## Requirements
 
@@ -103,16 +103,22 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-11 on the release code.
+one GPU serves the API). Measured 2026-11-11 on the release code (1.3).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 367 | 1,277 | 1,884 |
-| context 64K | 356 | 1,258 | 1,797 |
-| context 128K | 335 | 1,229 | 1,812 |
+| context 0 | 366 | 1,261 | 1,894 |
+| context 64K | 356 | 1,265 | 1,836 |
+| context 128K | 365 | 1,229 | 1,838 |
 
-Prefill: 53,333 tok/s on a 32K prompt (time to first token 0.61 s), 52,918 tok/s on 128K (2.43 s). The GPU ran
+Prefill: 57,082 tok/s on a 32K prompt (time to first token 0.57 s), 56,969 tok/s on 128K (2.26 s). The GPU ran
 at its power cap during prefill, as in every prefill number here.
+
+The benchmark restarts each stream with the same long prompt, so at 64K-128K part of what it measures is how fast the
+server turns the chat request back into tokens. 1.3 tokenizes chat prompts in pieces split at the template's special
+tokens, keeps recently seen pieces, and splits a long new piece across CPU threads (`patches/vllm/deepseek_v41.py`;
+the token ids are identical). A repeated 128K prompt is ready in 0.13 s instead of 0.33 s, and a new one tokenizes
+about 9x faster. Against 1.2: prefill +7-8%, 1 request at 128K +9%, 16 requests at 64K-128K +1-2%.
 
 Its scheduler tests (`--scheduler all`), which exercise admission, mixed prefill and decode, aborts and overload from the
 client side, all pass: burst (64 prompts of 30K tokens at once), agents (8 agents in 40-100K-token conversations for 10

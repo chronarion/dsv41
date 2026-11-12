@@ -23,6 +23,7 @@ import importlib
 import os
 import statistics
 import sys
+import json
 import time
 from collections import deque
 
@@ -209,6 +210,22 @@ def _batch1_step_k(scheduler_output):
     return len(spec)
 
 
+_KFILE = os.environ.get("DSV41_K_FILE")   # experiments: {"lo-hi": K, ...} drafts per pure-decode step by batch size,
+_KF = {"t": 0.0, "map": []}                 # re-read once a second (sweeps without a reboot); off when unset
+
+
+def _kfile_k(n):
+    now = time.time()
+    if now - _KF["t"] > 1.0:
+        _KF["t"] = now
+        try:
+            with open(_KFILE) as f:
+                _KF["map"] = [(int(r.split("-")[0]), int(r.split("-")[-1]), int(k)) for r, k in json.load(f).items()]
+        except Exception:  # noqa: BLE001  (a file being rewritten: keep the last map)
+            pass
+    return next((k for lo, hi, k in _KF["map"] if lo <= n <= hi), None)
+
+
 def _patch_scheduler(module):
     cls = module.Scheduler
     if getattr(cls, "_dsv41_dynk", False):
@@ -227,6 +244,8 @@ def _patch_scheduler(module):
                 k = DYN.choose([r.request_id for r in reqs])
             elif STATE["cap"] is not None and len(reqs) == 1:
                 k = STATE["cap"]
+            if k is None and _KFILE and len(reqs) >= 2:
+                k = _kfile_k(len(reqs))
         if k is not None:
             for req in reqs:
                 if len(req.spec_token_ids) != k:

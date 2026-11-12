@@ -173,7 +173,10 @@ def _after_prepare(runner, ib):
     drafts 1..K, row 0 the anchor. Only whole-step graphs mask; the rejection wrapper follows STATE["masked"]."""
     fb = sys.modules.get("fastpath_boundary")
     lam = LAMBDA_B if ib.num_reqs > 1 else (0.0 if MODE == "graphs" else LAMBDA)
-    on = fb is not None and fb.WS_DECODE[0] and lam > 0 and ib.num_draft_tokens > 0
+    # only where the mask skips work: the masked router (router_mega) takes T <= ROUTER_MEGA_MAX_T; above it (batch 7-8
+    # at 3 drafts) a mask would only cap acceptance (Fable r11 2.2: C8 +2.7%)
+    on = (fb is not None and fb.WS_DECODE[0] and lam > 0 and ib.num_draft_tokens > 0
+          and ib.num_tokens <= getattr(fb, "ROUTER_MEGA_MAX_T", 0))
     STATE["masked"] = on
     if fb is not None:
         fb.CW_ROWS = (ib.num_tokens,) if on else ()

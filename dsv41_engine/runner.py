@@ -121,7 +121,6 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_mem_refused: dict = {}     # key -> time a capture was refused for memory (retried after 60 s)
         self._ws_idle_s = float(os.environ.get("DSV41_WS_IDLE_S", "120"))
         self._ws_evicted = 0
-        self._ws_slack = 0                  # bytes of evicted graphs' pool blocks a new capture reuses before the device
         self._ws_t = time.time()
         self._ws_counts = {"stock": 0, "replay": 0, "capture": 0}
         self._ws_why: dict = {}            # why steps went to the stock path
@@ -586,25 +585,51 @@ class WholeStepRunner(GPUModelRunner):
                 except Exception as e:
                     _LOG(f"Mega Gate warm-up for E={E} failed: {e!r}")
 
-    def _ws_room(self, key):
-        """True while a new graph fits: capturing with the device nearly full failed mid-capture and the next stock step
-        ran out of memory (32 concurrent requests, 27 private-pool graphs holding 13 GB, 2026-11-11). Free memory counts
-        the pool blocks of evicted graphs (`_ws_slack`), which a new capture reuses before it asks the device. Never
-        torch.cuda.empty_cache() here: returning the allocator's cached blocks to the device crashed the engine with an
-        illegal address after evictions (twice, 2026-11-12; some kernel keeps a pointer into freed cached memory)"""
+    def _ws_pool_free(self):
+        """bytes free inside the graph pool (blocks of evicted graphs and the boot reserve)"""
+        if self._ws_pool is None:
+            return 0
+        return sum(b["size"] for seg in self._ws_pool.snapshot() for b in seg["blocks"] if b["state"] == "inactive")
+
+    def _ws_pool_init(self):
+        """the graphs' MemPool, with DSV41_WS_POOL_RESERVE_GB allocated and freed into it at once (the first capture runs
+        in the boot warm-up, while the device is still free), so later captures find blocks without the device"""
+        self._ws_pool = torch.cuda.MemPool()
+        gb = float(os.environ.get("DSV41_WS_POOL_RESERVE_GB", "2"))
+        if gb > 0:
+            with torch.cuda.use_mem_pool(self._ws_pool):
+                t = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8, device=self.device)
+            del t
+        # the reserve counts against DSV41_WS_POOL_GB: graphs and reserve together stay in 1.4's envelope (on top of
+        # it, the stock path's prefill indexer ran out of memory under agent traffic, 2026-11-12)
+        self._ws_pool_bytes += int(gb * (1 << 30))
+        _LOG(f"graph pool reserve {gb:g} GB ({self._ws_pool_free() >> 20} MiB free in the pool), counted in "
+             f"DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}")
+
+    def _ws_room(self, key, log=True):
+        """None while a new graph fits, else the reason. Graphs live in one MemPool with a reserve taken at the first
+        capture (DSV41_WS_POOL_RESERVE_GB), so a capture draws its blocks from the pool, not from what the caching
+        allocator left on the device: long prompts can leave under 1 GB of device memory free for hours (#5, 1.4's
+        validation). The device must still hold the driver's executable graph (tens of MB), and the pool may grow
+        only while the device keeps DSV41_WS_MIN_FREE_MIB. Never torch.cuda.empty_cache() here: returning the
+        allocator's cached blocks to the device crashed the engine with an illegal address after evictions (twice,
+        2026-11-12)"""
         free, _ = torch.cuda.mem_get_info()
+        pool_free = self._ws_pool_free()
         why = None
-        if free < (1 << 30) or free + self._ws_slack < self._ws_min_free:
-            why = f"{free >> 20} MiB free, below DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20}"
+        if free < (256 << 20):
+            why = ("device", f"{free >> 20} MiB free on the device, below the 256 MiB an executable graph needs")
+        elif self._ws_pool is not None and pool_free < (256 << 20) and free < self._ws_min_free:
+            why = ("pool", f"{pool_free >> 20} MiB free in the graph pool and {free >> 20} MiB on the device "
+                           f"(DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20})")
         elif key[0] > 1 and self._ws_pool_bytes >= self._ws_pool_budget:
-            why = f"the graph pool holds ~{self._ws_pool_bytes >> 20} MiB, DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}"
-        if why is None:
-            return True
-        if not self._ws_room_logged:
+            why = ("budget", f"the graphs hold ~{self._ws_pool_bytes >> 20} MiB, "
+                             f"DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}")
+        if why is not None and log and not self._ws_room_logged:
             self._ws_room_logged = True
-            _LOG(f"{why}: no more graphs are captured ({len(self._ws_graphs)} held); new keys such as {key} stay on the "
-                 f"stock path")
-        return False
+            _LOG(f"{why[1]}: no more graphs are captured ({len(self._ws_graphs)} held); new keys such as {key} stay "
+                 f"on the stock path")
+        return why
 
     def _ws_forget(self, g):
         """drop a freed graph's staging buffers: keyed by id(), a later graph's tensor could inherit them (#3)"""
@@ -614,10 +639,6 @@ class WholeStepRunner(GPUModelRunner):
                 ev = self._ws_ev.pop(("c", id(t), j), None)
                 if ev is not None:
                     ev.synchronize()
-
-    def _ws_pool_slack_avg(self):
-        held = [g.bytes for g in self._ws_graphs.values() if g.bytes]
-        return int(sum(held) / len(held)) if held else 0
 
     def _ws_evict_idle(self, n=8):
         """free up to n graphs idle for DSV41_WS_IDLE_S (least recently used first): without it, a server that saw
@@ -629,7 +650,6 @@ class WholeStepRunner(GPUModelRunner):
         for _, k in idle:
             g = self._ws_graphs.pop(k)
             self._ws_pool_bytes = max(0, self._ws_pool_bytes - g.bytes)
-            self._ws_slack += g.bytes
             self._ws_retired.append(g)
         torch.cuda.synchronize()         # nothing idle that long is in flight; the GPU is idle after this
         for old in self._ws_retired:
@@ -642,7 +662,10 @@ class WholeStepRunner(GPUModelRunner):
         return len(idle)
 
     def _ws_capture(self, key, so):
-        if not self._ws_room(key) and not (self._ws_evict_idle() and self._ws_room(key)):
+        why = self._ws_room(key)
+        if why is not None and why[0] != "device" and self._ws_evict_idle():
+            why = self._ws_room(key)
+        if why is not None:
             self._ws_failed.add(key)     # stays on the stock path (retried after 60 s: graphs may go idle by then)
             self._ws_mem_refused[key] = time.monotonic()
             self._no("no memory for another graph")
@@ -689,6 +712,8 @@ class WholeStepRunner(GPUModelRunner):
         for old in self._ws_retired:   # the GPU is idle here: no retired graph can still be running
             self._ws_forget(old)
         self._ws_retired.clear()
+        if self._ws_pool is None:      # before free0: the reserve is not this graph's memory
+            self._ws_pool_init()
         free0 = torch.cuda.mem_get_info()[0]
         with graph_capture(device=self.device):
             s = current_stream()
@@ -723,8 +748,8 @@ class WholeStepRunner(GPUModelRunner):
             failed = False
             try:
                 if self._ws_pool is None:
-                    self._ws_pool = torch.cuda.graph_pool_handle()
-                with g.patches.active("replay"), torch.cuda.graph(graph, stream=s, pool=self._ws_pool):
+                    self._ws_pool_init()
+                with g.patches.active("replay"), torch.cuda.graph(graph, stream=s, pool=self._ws_pool.id):
                     super().execute_model(steady)
                     ao = super().sample_tokens(None)
             except Exception as e:   # the step above already ran for real: serve its output, keep this key stock
@@ -760,11 +785,7 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_counts["capture"] += 1
         self._ws_eager_out = out
         free1 = torch.cuda.mem_get_info()[0]
-        g.bytes = max(0, free0 - free1)
-        if self._ws_slack:   # reused evicted blocks: charge this graph the average evicted size against the slack
-            est = max(g.bytes, self._ws_pool_slack_avg())
-            self._ws_slack = max(0, self._ws_slack - est)
-            g.bytes = est
+        g.bytes = max(0, free0 - free1)   # device memory: the executable graph plus any growth of the pool
         self._ws_pool_bytes += g.bytes
         _LOG(f"captured {key} in {time.time() - t0:.2f} s; device free {free0 >> 20} -> {free1 >> 20} MiB, "
              f"{len(self._ws_graphs)} graphs, pool ~{self._ws_pool_bytes >> 20} MiB")

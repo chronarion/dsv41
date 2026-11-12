@@ -29,4 +29,7 @@ class DSV41Worker(Worker):
         if os.environ.get("DSV41_REPLAY_SKIP") == "1":
             from .replay_skip import install   # A4 / S60: no decoder replay for prefill chunks nothing reads
             install()
+        if os.environ.get("DSV41_ACC_LOG"):
+            from .acc_log import install   # M5: shadow acceptance log for draft shaping (measurement only)
+            install()
         return WholeStepRunner(self.vllm_config, self.device)

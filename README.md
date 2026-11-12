@@ -22,7 +22,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `dsv41_engine/dynk.py` | ds41's DynK estimator (5 or 7 drafts per batch-1 step); off in the shipped profiles, which use `conf_width.py` |
 | `dsv41_engine/suffix.py` | copy (suffix) drafting: when the request's history repeats, batch-1 steps verify 31 copied tokens (one-hot draft distribution, so the output distribution is unchanged) |
 | `dsv41_engine/{ll_gemm,dflash_prep,fp8_head,capture,worker}.py` | low-latency MXFP8 GEMMs (pinned tactics at M <= 8; FlashInfer's low-latency kernel compiled with 16/32-row tiles for 8 < M <= 32, after vLLM #63921), drafter input prep, the optional FP8 verify head, capture helpers, the vLLM worker |
-| `kernels/vendor/ds41/fastpath/hook/rowmap-warm-v1.json` | the expert split: 256 hot experts per layer in GB300 HBM, 128 cold on the RTX, 24 of the cold ones also in HBM (warm: prefill, and the router's per-call redirect) |
+| `kernels/vendor/ds41/fastpath/hook/rowmap-warm-v2.json` | the expert split: 256 hot experts per layer in GB300 HBM, 128 cold on the RTX, 48 of the cold ones on layers 0-19 also in HBM for prefill (warm; `rowmap-warm-v1.json`: 24 on every layer) |
 | `kernels/vendor/ds41` | ds41's kernels and vLLM components (MIT) with our vLLM 0.32 ports and changes; `VENDORED.md` lists every change |
 | `kernels/vendor/b12x` | b12x (Apache-2.0), used by the RTX sidecar |
 | `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
@@ -105,16 +105,18 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-12 on the release code (1.4).
+one GPU serves the API). Measured 2026-11-12 on the release code (1.5).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 368 | 1,264 | 1,887 |
-| context 64K | 355 | 1,249 | 1,831 |
-| context 128K | 363 | 1,264 | 1,873 |
+| context 0 | 364 | 1,337 | 1,953 |
+| context 64K | 355 | 1,318 | 1,849 |
+| context 128K | 364 | 1,314 | 1,858 |
 
-Prefill: 57,161 tok/s on a 32K prompt (time to first token 0.56 s), 57,530 tok/s on 128K (2.23 s). The GPU ran
-at its power cap during prefill, as in every prefill number here.
+Prefill: 63,519 tok/s on a 32K prompt (time to first token 0.51 s), 64,255 tok/s on 128K (2.00 s). The GPU ran
+at its power cap during prefill, as in every prefill number here. 1.5 moved the cold experts that prefill computes on
+the GB300 to the layers that prefill runs in full (+11-12%; the RTX was holding the GB300 up on this text), and stopped
+capping per-request draft widths at batches 7-8, where the cap saved no work (8 requests +4-6%).
 
 The benchmark restarts each stream with the same long prompt, so at 64K-128K part of what it measures is how fast the
 server turns the chat request back into tokens. 1.3 tokenizes chat prompts in pieces split at the template's special
@@ -143,9 +145,11 @@ concurrent requests.
 Each decode step at batch 8 or below replays a captured CUDA graph, one per combination of batch size, draft width and
 sampling options, and the graphs share a memory budget (`DSV41_WS_POOL_GB`, 6 GB). Until 1.4 the graphs captured first
 kept the budget for good, so on a server that first saw tests or benchmarks, live traffic with other sampling settings
-ran mostly on the slower uncaptured path (issue #5: 31% of steps replayed). Now a graph unused for two minutes
+ran mostly on the slower uncaptured path (issue #5: 31% of steps replayed). Since 1.4 a graph unused for two minutes
 (`DSV41_WS_IDLE_S`) is freed when a new one needs the room, a request shape refused for memory is retried after a
-minute, and the server log's step counters name those refusals.
+minute, and the server log's step counters name those refusals. Since 1.5 the graphs live in their own memory pool with
+2 GB set aside at the first capture (`DSV41_WS_POOL_RESERVE_GB`): long prompts can leave less than 1 GB of device
+memory free for hours, and in 1.4 that stopped new captures while idle graphs were still being freed.
 
 ## Credits
 

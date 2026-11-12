@@ -108,6 +108,8 @@ reference-class gates, with changes noted per file.
   prefill path (T > FUSED_MAX) uses `row_map_static` (warm experts hot); `warm_row_map` feeds the router.
   `fastpath_coldskip.py` reads warm experts; `fastpath_a12_retire.py` counts hot + warm rows.
   `fastpath/hook/rowmap-warm-v1.json`: the h256 rowmap plus each layer's 24 most-picked cold experts (corpus counts).
+  `fastpath/hook/rowmap-warm-v2.json` (the default since 1.5): the same 960 warm slots, 48 per layer on layers 0-19 and
+  none on 20-39 (those layers run only the bounded 128-row replay at prefill).
   `w4-boundary`: `RouterParams` appends `warm_row` (int32[384] MegaMoE row or -1) and `redirect_cap` (ABI entry 23);
   router.cu (T <= 16) collects the launch's distinct cold experts after the drops and, above the cap, moves the first
   warm experts in token order to their MegaMoE rows (outputs written after the pass); router_mega.cu (16 < T <= 64)

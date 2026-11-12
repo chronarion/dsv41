@@ -17,3 +17,10 @@ Both are the image's files (md5 06738070... / 9ef4edc4...) plus the hunks marked
 `deepseek_v41_encoding.py` (`vllm/tokenizers/deepseek_v41_encoding.py`, the image's file plus the hunk marked `dsv41 A1`):
 `reasoning_effort` also accepts OpenAI's `minimal` (low's budget, 50) and `medium` (62, halfway between low and high).
 vLLM 0.32 accepted only low / high / xhigh / max and an integer, so agent clients that send `medium` got HTTP 400.
+
+`sampling_params.py` (`vllm/sampling_params.py`, the image's file plus the hunk marked `dsv41 A2`): `min_p` and
+`logit_bias` are accepted with speculative decoding. vLLM 0.32 refused both up front for every model. The GPU model
+runner V4.1 uses applies both to every verified position before rejection sampling, the same way it already applies
+top-k, top-p, `min_tokens` and `allowed_token_ids` there, so the output keeps the requested distribution.
+`bench/api_check.py` checks it: a +100 bias holds at every position, `min_p` 0.999 at temperature 1 equals greedy, and
+no sampled token falls below `min_p`'s bound.

@@ -57,10 +57,7 @@ for name, (extra, check) in CASES.items():
         print(f"{'PASS' if good else 'FAIL'}  {name}" + ("" if good else f": {body(r)[:90]!r}"), flush=True)
         ok += good
     except urllib.error.HTTPError as e:
-        msg = e.read()[:160]
-        known = e.code == 400 and b"not yet supported with speculative decoding" in msg    # vLLM refuses these up front
-        print(f"{'SKIP' if known else 'FAIL'}  {name}: HTTP {e.code} {msg!r}", flush=True)
-        ok += known
+        print(f"FAIL  {name}: HTTP {e.code} {e.read()[:160]!r}", flush=True)
     except Exception as e:
         print(f"FAIL  {name}: {e!r}", flush=True)
 try:
@@ -71,7 +68,8 @@ except Exception as e:
 print(f"{'PASS' if stream_ok else 'FAIL'}  streaming", flush=True)
 ok += stream_ok
 # mixed options in one batch: the greedy streams must still give the exact answer
-mix, res, lock = [{}, {"temperature": 0.7}, {"temperature": 1.0, "top_k": 20}, {"temperature": 1.0, "seed": 3}, {"logprobs": True}, {}], [], threading.Lock()
+mix, res, lock = [{}, {"temperature": 0.7}, {"temperature": 1.0, "top_k": 20}, {"temperature": 1.0, "seed": 3}, {"logprobs": True},
+                  {"temperature": 1.0, "min_p": 0.1}, {"logit_bias": {"1000": -5}}, {}], [], threading.Lock()
 
 
 def one(e):
@@ -85,4 +83,51 @@ th = [threading.Thread(target=one, args=(e,)) for e in mix]
 [t.start() for t in th]; [t.join() for t in th]
 print(f"{'PASS' if all(res) else 'FAIL'}  mixed batch {sum(res)}/{len(res)}", flush=True)
 ok += all(res)
-print(f"API {ok}/{len(CASES) + 2}")
+# min_p and logit_bias at the drafted positions too (speculative decoding verifies several tokens per step): a +100
+# bias must hold at every position, min_p near 1 must equal greedy, and no sampled token may fall below min_p's bound
+EXTRA = 3
+try:
+    tok = json.load(urllib.request.urlopen(urllib.request.Request(url.rsplit("/v1", 1)[0] + "/tokenize", json.dumps(
+        {"model": model, "prompt": "Z", "add_special_tokens": False}).encode(), {"Content-Type": "application/json"})))
+    zid = tok["tokens"][0]
+    r = post({"logit_bias": {str(zid): 100}, "max_tokens": 40, "ignore_eos": True})
+    good = body(r) == "Z" * 40
+    print(f"{'PASS' if good else 'FAIL'}  logit_bias +100 at every position" + ("" if good else f": {body(r)[:60]!r}"), flush=True)
+    ok += good
+except Exception as e:
+    print(f"FAIL  logit_bias +100 at every position: {e!r}", flush=True)
+EXTRA += 1   # the reverse: a penalty request after the bias graphs above must still be penalized (graphs are keyed by
+             # "some logits processor", so a request must take the stock path rather than another processor's graph)
+try:
+    ZP = "Output the letter Z 60 times with no spaces, nothing else."
+    plain = body(post({"max_tokens": 30, "ignore_eos": True}, prompt=ZP))
+    pen = body(post({"max_tokens": 30, "ignore_eos": True, "frequency_penalty": 2.0}, prompt=ZP))
+    stock = body(post({"max_tokens": 30, "ignore_eos": True, "frequency_penalty": 2.0, "logprobs": True}, prompt=ZP))
+    good = pen != plain and pen == stock
+    print(f"{'PASS' if good else 'FAIL'}  frequency_penalty after logit_bias graphs" +
+          ("" if good else f": {pen[:40]!r} vs no-penalty {plain[:40]!r}, stock path {stock[:40]!r}"), flush=True)
+    ok += good
+except Exception as e:
+    print(f"FAIL  frequency_penalty after logit_bias graphs: {e!r}", flush=True)
+try:
+    g, m = body(post({})), body(post({"temperature": 1.0, "min_p": 0.999}))
+    good = END in m and m == g
+    print(f"{'PASS' if good else 'FAIL'}  min_p 0.999 equals greedy" + ("" if good else f": {m[:60]!r}"), flush=True)
+    ok += good
+except Exception as e:
+    print(f"FAIL  min_p 0.999 equals greedy: {e!r}", flush=True)
+try:
+    import math
+    below = total = 0
+    for seed in range(4):
+        r = post({"temperature": 1.0, "min_p": 0.3, "seed": seed, "max_tokens": 160, "logprobs": True, "top_logprobs": 5},
+                 prompt="Write a short free-verse poem about a harbor at night.")
+        for c in r["choices"][0]["logprobs"]["content"]:   # vLLM lists the sampled token first, unsorted: take the max
+            total += 1
+            below += c["logprob"] < max(t["logprob"] for t in c["top_logprobs"]) + math.log(0.3) - 1e-3
+    good = total > 300 and below == 0
+    print(f"{'PASS' if good else 'FAIL'}  min_p 0.3 bound: {below} of {total} sampled tokens below it", flush=True)
+    ok += good
+except Exception as e:
+    print(f"FAIL  min_p 0.3 bound: {e!r}", flush=True)
+print(f"API {ok}/{len(CASES) + 2 + EXTRA}")

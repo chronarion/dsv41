@@ -125,21 +125,7 @@ class WholeStepRunner(GPUModelRunner):
         # per request slot: does a logits processor (penalties, bad words, logit bias, plugins) or a thinking budget
         # touch its logits? The sampler's own temperature / top-k / top-p / min-p handling is captured in the graph
         # (its host-side branches are part of the graph key), so only these exclude a request.
-        self._ws_proc = np.zeros(self.max_num_reqs, dtype=bool)
-        smp = self.sampler
-        if smp is not None:
-            for proc in smp.logits_processors:
-                def proc_add(req_idx, params, _o=proc.add_request):
-                    r = _o(req_idx, params)
-                    if r:
-                        self._ws_proc[req_idx] = True
-                    return r
-                proc.add_request = proc_add
-
-            def smp_add(req_idx, params, _o=smp.add_request):
-                self._ws_proc[req_idx] = False
-                return _o(req_idx, params)
-            smp.add_request = smp_add
+        self._ws_proc = np.zeros(self.max_num_reqs, dtype=bool)   # set by the hooks _ws_hook_sampler installs
         if os.environ.get("DSV41_SUFFIX") == "1":
             from .suffix import register_runner
             register_runner(self)    # the drafter's matcher and the scheduler read the request states
@@ -151,9 +137,33 @@ class WholeStepRunner(GPUModelRunner):
             from .ll_gemm import install   # G3: low-latency MXFP8 GEMM tactics, before warm-up and capture
             install()
         r = super().load_model(*args, **kwargs)
+        self._ws_hook_sampler()
         if os.environ.get("DSV41_HEAD_FP8") in ("1", "dg"):
             self._ws_install_fp8_head()
         return r
+
+    def _ws_hook_sampler(self):
+        """mark the request slots whose logits a logits processor touches (vLLM's sampler is built in load_model, so
+        this runs after it; until 1.2 it ran in __init__, found no sampler, and such requests replayed graphs captured
+        for other processors: a penalty graph dropped a logit bias and the reverse)"""
+        smp = getattr(self, "sampler", None)
+        if smp is None:
+            if self._ws_on:
+                raise RuntimeError("DSV41_WHOLE_STEP: no sampler after load_model; cannot mark logits-processor requests")
+            return
+        for proc in smp.logits_processors:
+            def proc_add(req_idx, params, _o=proc.add_request):
+                r = _o(req_idx, params)
+                if r:
+                    self._ws_proc[req_idx] = True
+                return r
+            proc.add_request = proc_add
+
+        def smp_add(req_idx, params, _o=smp.add_request):
+            self._ws_proc[req_idx] = False
+            return _o(req_idx, params)
+        smp.add_request = smp_add
+        _LOG(f"marking requests of {len(smp.logits_processors)} logits processors for the stock path")
 
     def _ws_install_fp8_head(self):
         """lossy option F9/S10: the verify head as a weight-only FP8 GEMV for <= 32 rows (dsv41_engine.fp8_head);

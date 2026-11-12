@@ -72,8 +72,8 @@ Release check of both profiles (2026-11-06): QA 6/6; tool calls 2/2 with thinkin
 
 Request options: temperature, top_p, top_k, seed, stop, max_tokens, min_tokens, n, logprobs, penalties, JSON schema,
 streaming and thinking all work, also mixed in one batch. `reasoning_effort` takes none, minimal, low, medium, high,
-xhigh or max (or 1-100); medium sits halfway between low and high. vLLM refuses `min_p` and `logit_bias` with
-speculative decoding.
+xhigh or max (or 1-100); medium sits halfway between low and high. `min_p` and `logit_bias` work too (stock vLLM 0.32
+refuses them with speculative decoding; see `patches/vllm/README.md`).
 
 
 Decode KLD is against the official inference code on the same weights. The official code's own batch-size dependence is
@@ -115,12 +115,12 @@ Prefill: 53,333 tok/s on a 32K prompt (time to first token 0.61 s), 52,918 tok/s
 at its power cap during prefill, as in every prefill number here.
 
 Its scheduler tests (`--scheduler all`), which exercise admission, mixed prefill and decode, aborts and overload from the
-client side: burst (64 prompts of 30K tokens at once), agents (8
-agents in 40-100K-token conversations for 10 minutes), arrivals, short-under-long, abort-storm and soak-mix pass. In
-overload, an open queue at twice the server's capacity with about 1,000 requests waiting, the server stays healthy, logs no
-error and drains, but the benchmark counts client-side failures while ~1,000 requests are in flight (58 to 180 of about
-2,100 across runs), so that test reports FAIL. (burst, agents and overload were run on the release code; the other four on
-the same day's build before the issue #1-#3 fixes.)
+client side, all pass: burst (64 prompts of 30K tokens at once), agents (8 agents in 40-100K-token conversations for 10
+minutes), arrivals, short-under-long, overload (an open queue at twice the server's capacity, up to 992 requests waiting:
+2,056 of 2,056 completed, drained in 172 s), abort-storm and soak-mix. Overload holds about 1,000 connections open at
+once, so raise the client's open-file limit first (`ulimit -n 65536`): with the default 1,024 the benchmark's own
+connections fail with `ConnectError` while the server stays healthy. (burst, agents and overload were run on the release
+code; arrivals, short-under-long, abort-storm and soak-mix on the 2026-11-11 build before the issue #1-#3 fixes.)
 
 ## Agent traffic
 

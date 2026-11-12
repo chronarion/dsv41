@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session  # noqa: E402
 
 CORPUS = os.environ.get("DSV41_KLD_CORPUS", "corpus.json")
+WS_DECODE_FLAG = False
 
 
 class Forcer:
@@ -27,6 +28,12 @@ class Forcer:
     def _execute_model(self, scheduler_output, *a, **k):
         import torch
         rs = self.runner.req_states
+        if WS_DECODE_FLAG:   # --ws-decode: pure decode steps route as the served whole-step decode graphs do (fast's drops)
+            fb = sys.modules.get("fastpath_boundary")
+            pure = (scheduler_output.num_scheduled_tokens and all(
+                rid in scheduler_output.scheduled_spec_decode_tokens for rid in scheduler_output.num_scheduled_tokens))
+            if fb is not None:
+                fb.WS_DECODE[0] = bool(pure)
         for rid, st in self.active.items():
             if rid in scheduler_output.scheduled_spec_decode_tokens and st["phase"] == "decode":
                 if st.get("stash"):
@@ -57,17 +64,18 @@ class Forcer:
             p, K = st["p"], st["K"]
             c0 = int(input_batch.cu_num_logits_np[b])
             c1 = int(input_batch.cu_num_logits_np[b + 1])
-            assert c1 - c0 == K + 1, (c0, c1, K)
+            n = c1 - c0   # K + 1, or fewer on a step that scheduled fewer drafts (batch >= 8: e.g. a step with no drafts)
+            assert 1 <= n <= K + 1, (c0, c1, K)
             rows = input_batch.logits_indices[c0:c1]
             lg = self.runner.model.compute_logits(hidden_states[rows]).float()
             st["logits"].append(lg.cpu())
-            st["pos"].extend(range(p, p + K + 1))
-            st["tgt"].extend(ids[p + 1:p + K + 2])
-            so.sampled_token_ids[b, :K + 1] = torch.tensor(ids[p + 1:p + K + 2], dtype=so.sampled_token_ids.dtype,
-                                                           device=so.sampled_token_ids.device)
-            ns[b] = K + 1
+            st["pos"].extend(range(p, p + n))
+            st["tgt"].extend(ids[p + 1:p + n + 1])
+            so.sampled_token_ids[b, :n] = torch.tensor(ids[p + 1:p + n + 1], dtype=so.sampled_token_ids.dtype,
+                                                       device=so.sampled_token_ids.device)
+            ns[b] = n
             nr[b] = 0
-            st["p"] = p + K + 1
+            st["p"] = p + n
         return so, ns, nr
 
 
@@ -148,14 +156,18 @@ def main():
     ap.add_argument("--routes", default="full,eager", help="full: FULL-graph replays (served default); eager: the NONE "
                     "cudagraph route, which the captured whole step records; captured: the captured whole step itself "
                     "(engine/harness/whole_step.py) with a forced sampler reading the corpus from a device buffer")
+    ap.add_argument("--ws-decode", action="store_true", help="set fastpath_boundary.WS_DECODE on pure decode steps, so "
+                    "the lossy routing options gated to decode graphs (DSV41_DROP_DECODE_ONLY) apply on the eager route")
     a = ap.parse_args()
+    global WS_DECODE_FLAG
+    WS_DECODE_FLAG = a.ws_decode
     os.makedirs(a.out, exist_ok=True)
     from whole_step import force_eager
     import contextlib
     W = [w for w in json.load(open(CORPUS)) if len(w["ids"]) == 2048]
     if a.windows:
         W = [w for w in W if w["id"] in a.windows.split(",")]
-    llm, runner = session.load(async_scheduling=False)
+    llm, runner = session.load(async_scheduling=False, max_num_seqs=max(4, a.batch))
     K = runner.num_speculative_steps
     f = Forcer(runner)
     eng = llm.llm_engine

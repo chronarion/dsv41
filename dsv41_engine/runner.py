@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 
 from .capture import StepPatches, steady_scheduler_output
 
+_DEBUG_EC = int(os.environ.get("DSV41_DEBUG_EMPTY_CACHE_EVERY", "0") or 0)   # stale-pointer hunt (2026-11-12)
 _LOG = lambda m: sys.stderr.write(f"DSV41_WHOLE_STEP {m}\n")
 _PARAMS = ("temperature", "top_k", "top_p", "min_p", "seeds")
 # vLLM's WorkspaceManager frees its buffer and allocates a larger one whenever a step needs more (the V2 runner never
@@ -119,7 +120,9 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_eager_out = None    # the first step's real output, returned by sample_tokens
         self._ws_failed: set = set()
         self._ws_mem_refused: dict = {}     # key -> time a capture was refused for memory (retried after 60 s)
-        self._ws_idle_s = float(os.environ.get("DSV41_WS_IDLE_S", "120"))
+        # eviction is off by default since 1.7: freeing graphs left a pointer into their memory somewhere, and a later
+        # return of cached blocks to the device turned it into an illegal address (3 crashes, 2026-11-12)
+        self._ws_idle_s = float(os.environ.get("DSV41_WS_IDLE_S", "0"))
         self._ws_evicted = 0
         self._ws_t = time.time()
         self._ws_counts = {"stock": 0, "replay": 0, "capture": 0}
@@ -258,6 +261,11 @@ class WholeStepRunner(GPUModelRunner):
 
     # ------------------------------------------------------------------------------------------------ the step
     def execute_model(self, scheduler_output, intermediate_tensors=None, dummy_run=False, *args, **kwargs):
+        if _DEBUG_EC and not dummy_run:   # debugging only: return the allocator's cached blocks every N steps
+            self._dbg_steps = getattr(self, "_dbg_steps", 0) + 1
+            if self._dbg_steps % _DEBUG_EC == 0:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
         key = None
         if self._ws_on and not dummy_run and not args and not kwargs and intermediate_tensors is None:
             key = self._ws_key(scheduler_output)
@@ -617,8 +625,8 @@ class WholeStepRunner(GPUModelRunner):
         free, _ = torch.cuda.mem_get_info()
         pool_free = self._ws_pool_free()
         why = None
-        if free < (256 << 20):
-            why = ("device", f"{free >> 20} MiB free on the device, below the 256 MiB an executable graph needs")
+        if free < (1 << 30):   # the stock path's prefill needs the last GB (the indexer asks ~0.5 GB at a time)
+            why = ("device", f"{free >> 20} MiB free on the device, below the 1 GiB kept for the stock path")
         elif self._ws_pool is not None and pool_free < (256 << 20) and free < self._ws_min_free:
             why = ("pool", f"{pool_free >> 20} MiB free in the graph pool and {free >> 20} MiB on the device "
                            f"(DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20})")
@@ -643,6 +651,8 @@ class WholeStepRunner(GPUModelRunner):
     def _ws_evict_idle(self, n=8):
         """free up to n graphs idle for DSV41_WS_IDLE_S (least recently used first): without it, a server that saw
         varied traffic keeps its first graphs forever and its common keys stay on the stock path once memory is full"""
+        if self._ws_idle_s <= 0:
+            return 0
         now = time.monotonic()
         idle = sorted((g.last, k) for k, g in self._ws_graphs.items() if now - g.last > self._ws_idle_s)[:n]
         if not idle:

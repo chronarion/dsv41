@@ -157,6 +157,11 @@ ran mostly on the slower uncaptured path (issue #5: 31% of steps replayed). Sinc
 minute, and the server log's step counters name those refusals. Since 1.5 the graphs live in their own memory pool with
 2 GB set aside at the first capture (`DSV41_WS_POOL_RESERVE_GB`): long prompts can leave less than 1 GB of device
 memory free for hours, and in 1.4 that stopped new captures while idle graphs were still being freed.
+1.7 turns the freeing of idle graphs off by default (`DSV41_WS_IDLE_S=0`; set it to 120 to turn it back on): under
+memory pressure, a graph freed earlier could leave a stale pointer behind that became an illegal memory access once
+PyTorch returned its cached memory to the device (seen 3 times in testing; never without a freed graph). Refused shapes
+are still retried every minute, and new graphs are not captured while less than 1 GB of device memory is free, so the
+prefill path keeps the room it needs.
 
 ## Credits
 

@@ -271,8 +271,8 @@ def agent(i, stop_at):
                 except ValueError:
                     if finish != "length":
                         note("bad-tool-args", i, f"finish {finish}, {c['function']['name']}: {c['function']['arguments'][:200]!r}")
-                if c["function"]["name"] not in {t["function"]["name"] for t in TOOLS}:
-                    note("unknown-tool", i, c["function"]["name"])
+                if c["function"]["name"] not in {t["function"]["name"] for t in TOOLS} and finish != "length":
+                    note("unknown-tool", i, f"finish {finish}: {c['function']['name']!r}")   # a length cut can split a name
             if not calls and not (msg.get("content") or "").strip() and finish != "length":
                 note("empty", i, f"finish {finish}, reasoning {len(msg.get('reasoning_content') or '')} chars")
             with lock:

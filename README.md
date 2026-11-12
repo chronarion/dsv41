@@ -46,7 +46,8 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
       -d '{"model": "dsv41", "messages": [{"role": "user", "content": "Hello"}]}'
     ./dsv41.sh down
 
-The first boot JIT-compiles kernels (cached under `STATE`); later boots take about 8 minutes. Once the server answers,
+The first boot JIT-compiles kernels (cached under `STATE`); later boots take about 8 minutes. After updating the checkout
+(`git pull`), run `./build.sh` again: `runtime/` is build output and must match the checkout. Once the server answers,
 `dsv41.sh` sends a short warm-up (`bench/warm.py`, about 15 s) shaped like real client requests, so the first live
 requests already find their decode-step graphs (`DSV41_WARM=0` skips it).
 

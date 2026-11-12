@@ -31,6 +31,12 @@ down() {
 
 sidecar() {
   mkdir -p $STATE/{sidecar-logs,b12x}
+  # runtime/ is build output: after `git pull` it can be older than the checkout (#6: a new row map in the profile)
+  if [ ! -f "$RUNTIME/hook/$ROWMAP" ]; then
+    log "runtime/hook has no $ROWMAP: runtime/ is older than the checkout; run ./build.sh"; return 1
+  fi
+  diff -rq "$E/kernels/vendor/ds41/fastpath/hook" "$RUNTIME/hook" >/dev/null 2>&1 \
+    || log "warning: runtime/hook differs from the checkout (kernels/vendor/ds41/fastpath/hook); run ./build.sh after updating"
   log "starting the RTX sidecar"
   docker run -d --name $NAME-sidecar --restart no --device nvidia.com/gpu=$RTX --ipc host --network none \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 \

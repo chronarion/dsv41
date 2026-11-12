@@ -19,6 +19,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `dsv41_engine/conf_width.py` | per-step verify width from the current drafts' confidences. At batch 1 the runner replays a graph of exactly that many drafts (one per width); at batch 2 and up each request's rows beyond its width are masked inside the graph, skipping their experts. Stops at the first position it refuses, so the output distribution is unchanged |
 | `dsv41_engine/replay_skip.py` | intermediate prefill chunks skip the decoder replay nothing reads |
 | `dsv41_engine/prefill_indices.py` | fixes a vLLM 0.32 bug: sparse prefill read stale index rows, which put NaN into short requests batched with a long one |
+| `dsv41_engine/sampler_scratch.py` | fixes a vLLM 0.32 bug: the top-k sampler's scratch buffer was freed when a larger batch replaced it, while graphs captured earlier kept writing into it (dormant with this server's traffic, where the first use already creates the largest buffer) |
 | `dsv41_engine/dynk.py` | ds41's DynK estimator (5 or 7 drafts per batch-1 step); off in the shipped profiles, which use `conf_width.py` |
 | `dsv41_engine/suffix.py` | copy (suffix) drafting: when the request's history repeats, batch-1 steps verify 31 copied tokens (one-hot draft distribution, so the output distribution is unchanged) |
 | `dsv41_engine/{ll_gemm,dflash_prep,fp8_head,capture,worker}.py` | low-latency MXFP8 GEMMs (pinned tactics at M <= 8; FlashInfer's low-latency kernel compiled with 16/32-row tiles for 8 < M <= 32, after vLLM #63921), drafter input prep, the optional FP8 verify head, capture helpers, the vLLM worker |
@@ -50,6 +51,11 @@ The first boot JIT-compiles kernels (cached under `STATE`); later boots take abo
 (`git pull`), run `./build.sh` again: `runtime/` is build output and must match the checkout. Once the server answers,
 `dsv41.sh` sends a short warm-up (`bench/warm.py`, about 15 s) shaped like real client requests, so the first live
 requests already find their decode-step graphs (`DSV41_WARM=0` skips it).
+
+To keep prompt KV in host memory as well (vLLM's native KV offload), set `KV_OFFLOAD_GB`, for example
+`KV_OFFLOAD_GB=32 MODEL=... ./dsv41.sh up`. A prompt pushed out of GPU memory then comes back from host RAM instead of
+being computed again: a 40K-token prompt answered in 0.05 s instead of 0.6 s. Decode speed is unchanged (1.8 and later:
+the decode-step graphs keep running with the offload hooks around them). 32 GB of host memory holds about 14M tokens.
 
 ## Profiles and measured speed
 
@@ -106,22 +112,22 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-12 on the release code (1.6).
+one GPU serves the API). Measured 2026-11-12 on the release code (1.8).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 376 | 1,346 | 1,945 |
-| context 64K | 371 | 1,324 | 1,844 |
-| context 128K | 360 | 1,283 | 1,856 |
+| context 0 | 373 | 1,332 | 1,948 |
+| context 64K | 370 | 1,329 | 1,868 |
+| context 128K | 359 | 1,341 | 1,889 |
 
-Prefill: 65,579 tok/s on a 32K prompt (time to first token 0.49 s), 65,470 tok/s on 128K (1.96 s). The GPU ran
+Prefill: 65,851 tok/s on a 32K prompt (time to first token 0.49 s), 66,128 tok/s on 128K (1.94 s). The GPU ran
 at its power cap during prefill, as in every prefill number here. 1.5 moved the cold experts that prefill computes on
 the GB300 to the layers that prefill runs in full (+11-12%; the RTX was holding the GB300 up on this text), and stopped
 capping per-request draft widths at batches 7-8, where the cap saved no work (8 requests +4-6%). 1.6 stopped the
 output detokenizer from decoding the whole prompt before a request's first token (46 ms at 128K): +2-3% prefill, and a
 repeated 128K prompt answers in 0.06 s.
 
-The `fast` profile (lossy, KLD 0.034; see Profiles) on the same release: 1 request 398 / 395 / 382 tok/s at context 0 /
+The `fast` profile (lossy, KLD 0.034; see Profiles) on 1.6: 1 request 398 / 395 / 382 tok/s at context 0 /
 64K / 128K, 8 requests 1,514 / 1,487 / 1,482, 16 requests 1,898 / 1,817 / 1,844, prefill 66.2K / 66.8K tok/s. Its lossy
 options apply inside the decode-step graphs (batches up to 8), so 16 requests run at the default profile's speed.
 
@@ -157,11 +163,17 @@ ran mostly on the slower uncaptured path (issue #5: 31% of steps replayed). Sinc
 minute, and the server log's step counters name those refusals. Since 1.5 the graphs live in their own memory pool with
 2 GB set aside at the first capture (`DSV41_WS_POOL_RESERVE_GB`): long prompts can leave less than 1 GB of device
 memory free for hours, and in 1.4 that stopped new captures while idle graphs were still being freed.
-1.7 turns the freeing of idle graphs off by default (`DSV41_WS_IDLE_S=0`; set it to 120 to turn it back on): under
-memory pressure, a graph freed earlier could leave a stale pointer behind that became an illegal memory access once
-PyTorch returned its cached memory to the device (seen 3 times in testing; never without a freed graph). Refused shapes
-are still retried every minute, and new graphs are not captured while less than 1 GB of device memory is free, so the
-prefill path keeps the room it needs.
+1.7 turns the freeing of idle graphs off by default (`DSV41_WS_IDLE_S=0`): three crashes in testing (illegal memory
+access) followed freed graphs. Refused shapes are still retried every minute, and new graphs are not captured while
+less than 1 GB of device memory is free, so the prefill path keeps the room it needs.
+
+Since 1.8 every graph is captured on one CUDA stream (issue #7). Before, each capture ran on a new stream, and PyTorch
+only reuses free memory on the stream that freed it, so no graph could use the memory of another, of a freed graph or of
+the reserve: the pool grew with every capture. Now graphs share their scratch memory, about 100 graphs fit in the 2 GB
+reserve, and the budget is checked against the pool's real size. Under the forced-eviction test that crashed 1.4 (graph
+budget 0.4 GB, graphs freed after 5 s idle) 1.8 ran clean, as it did in shieldstar's tests with 375 evictions. Freeing
+idle graphs stays off by default because the pool now rarely fills; `DSV41_WS_IDLE_S=120` turns it on.
+`DSV41_WS_ONE_STREAM=0` restores the old behavior for comparison.
 
 ## Credits
 
@@ -171,4 +183,5 @@ The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT;
 `THIRD_PARTY.md`). This engine is built on vLLM (Apache-2.0) and uses b12x (Apache-2.0) in the sidecar.
 
 The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#5), including their
-root-cause analysis, proposed patches and the warm-up script. The load and agent tests use Local Inference Lab's llm-inference-bench.
+root-cause analysis, proposed patches and the warm-up script; the shared graph pool (#7) and graph replay under KV
+offload (#8) in 1.8 are their patches. The load and agent tests use Local Inference Lab's llm-inference-bench.

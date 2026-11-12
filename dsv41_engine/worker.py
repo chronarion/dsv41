@@ -10,6 +10,9 @@ class DSV41Worker(Worker):
         assert self.use_v2_model_runner, "the dsv41 engine extends vLLM's V2 model runner"
         from .prefill_indices import install
         install()                         # stale sparse prefill indices (vLLM 0.32): not an option
+        if os.environ.get("DSV41_SAMPLER_SCRATCH_FIX", "1") != "0":   # "log": log growth, free as stock does
+            from .sampler_scratch import install   # top-k scratch freed under live graphs (vLLM 0.32)
+            install(retain=os.environ.get("DSV41_SAMPLER_SCRATCH_FIX", "1") == "1")
         if os.environ.get("DSV41_SUFFIX") == "1":
             from .suffix import install   # G6: the speculator is built inside the runner's constructor
             install()

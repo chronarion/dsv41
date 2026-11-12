@@ -87,6 +87,7 @@ main() {
     --long-prefill-token-threshold 6144 --enable-prefix-caching \
     --speculative-config "$SPEC" \
     --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256 \
+    ${KV_OFFLOAD_GB:+--kv-offloading-backend native --kv-offloading-size $KV_OFFLOAD_GB} \
     --override-generation-config '{"temperature": 1.0, "top_p": 0.95}' \
     --default-chat-template-kwargs '{"reasoning_effort":"high"}' \
     ${DSV41_TORCH_PROFILE:+--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/vllm/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'} \

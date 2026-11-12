@@ -7,6 +7,7 @@ steady scheduler output. Later steps do the stock host bookkeeping (finished / a
 zeroing), refresh the graph's persistent batch constants and sampling parameters when they change, and replay the
 graph: target forward, LM head, rejection, post-update and the DSpark drafter in one launch. Everything else runs the
 stock path. DSV41_WHOLE_STEP=0 disables it."""
+import contextlib
 import os
 import sys
 import time
@@ -70,7 +71,8 @@ class _Graph:
         self.replays = 0
         self.gen = None          # workspace generation the graph was captured under
         self.last = 0.0          # monotonic time of its last capture or replay (idle graphs are evicted when full)
-        self.bytes = 0           # device memory its capture took
+        self.bytes = 0           # what it holds in the graph pool
+        self.driver = 0          # device memory its capture took outside PyTorch's allocator (the executable graph)
 
 
 class WholeStepRunner(GPUModelRunner):
@@ -88,7 +90,14 @@ class WholeStepRunner(GPUModelRunner):
         # its whole width set) plus a free-memory floor, and no graphs above batch 8, where vLLM's boot-time graphs serve
         # (the whole-step gain is host overhead, which matters at small batches; C16 measured no slower without it)
         self._ws_pool = None
-        self._ws_pool_bytes = 0
+        # One capture stream for the reserve and every capture (DSV41_WS_ONE_STREAM=0: vLLM's new stream per capture, as
+        # until 1.6). PyTorch's allocator hands a free block only to the stream that allocated it, so on a new stream
+        # a capture found neither the reserve nor the blocks of evicted graphs, and took its memory from the device
+        self._ws_one_stream = os.environ.get("DSV41_WS_ONE_STREAM", "1") == "1"
+        self._ws_stream = None
+        self._ws_driver_bytes = 0     # the live graphs' memory outside PyTorch's allocator
+        # a capture's expected pool memory per verify row (measured ~10 MiB: batch 1 x 1 draft 30 MiB, 8 x 3 300-330)
+        self._ws_row_bytes = int(os.environ.get("DSV41_WS_ROW_MIB", "12")) << 20
         self._ws_pool_budget = int(float(os.environ.get("DSV41_WS_POOL_GB", "6")) * (1 << 30))
         self._ws_min_free = int(os.environ.get("DSV41_WS_MIN_FREE_MIB", "4096")) << 20
         self._ws_max_batch = int(os.environ.get("DSV41_WS_MAX_BATCH", "8"))
@@ -118,6 +127,12 @@ class WholeStepRunner(GPUModelRunner):
         _install_workspace_hook()
         self._ws_pending = None      # (graph, req_ids) for the following sample_tokens
         self._ws_eager_out = None    # the first step's real output, returned by sample_tokens
+        # vLLM's native KV offload connector (--kv-offloading-size) attaches metadata to every step, also an empty one.
+        # Its worker hooks are step-external (no per-layer work; transfers run on its own streams, ordered behind this
+        # stream at submission), so a step whose metadata has no load and nothing to flush replays its graph with the
+        # hooks run around it, as vLLM's own no-forward step runs them. DSV41_KV_REPLAY=0: any connector step is stock.
+        self._ws_kv_replay = os.environ.get("DSV41_KV_REPLAY", "1") == "1"
+        self._ws_kv_fin = None       # (finished_req_ids,) of a replay step whose connector hooks sample_tokens finishes
         self._ws_failed: set = set()
         self._ws_mem_refused: dict = {}     # key -> time a capture was refused for memory (retried after 60 s)
         # eviction is off by default since 1.7: freeing graphs left a pointer into their memory somewhere, and a later
@@ -203,6 +218,23 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_why[why] = self._ws_why.get(why, 0) + 1
         return None
 
+    def _ws_kv_why(self, m):
+        """why a step with this KV connector metadata takes the stock path, or None when it may replay. A load stays
+        stock (its submission follows a real forward there), and so does a flush: the worker then waits on the host
+        for a store whose source block this step is about to overwrite, before the step is launched"""
+        if m is None:
+            return None
+        if not self._ws_kv_replay:
+            return "kv connector (DSV41_KV_REPLAY=0)"
+        t = type(m)
+        if t.__name__ != "OffloadingConnectorMetadata" or not t.__module__.endswith(".offloading.common"):
+            return "kv connector: not the native offloading connector"
+        if m.load_jobs:
+            return "kv connector: load"
+        if m.jobs_to_flush:
+            return "kv connector: flush"
+        return None
+
     def _ws_key(self, so):
         if so.total_num_scheduled_tokens == 0:
             return self._no("empty")
@@ -210,8 +242,11 @@ class WholeStepRunner(GPUModelRunner):
             return self._no("new requests")
         if so.has_structured_output_requests:
             return self._no("structured output")
-        if so.kv_connector_metadata is not None or so.preempted_req_ids or so.kv_cache_block_copies:
-            return self._no("kv connector / preempted / block copies")
+        if so.preempted_req_ids or so.kv_cache_block_copies:
+            return self._no("preempted / block copies")
+        why = self._ws_kv_why(so.kv_connector_metadata)
+        if why is not None:
+            return self._no(why)
         spec = so.scheduled_spec_decode_tokens
         reqs = list(so.num_scheduled_tokens)
         if not spec or any(r not in spec for r in reqs):
@@ -363,6 +398,13 @@ class WholeStepRunner(GPUModelRunner):
         self.update_requests(so)
         self.block_tables.apply_staged_writes()
         self._ws_sync()
+        if so.kv_connector_metadata is not None:
+            # where the stock step calls it: after the bookkeeping (block zeroing included), before the launch. Binds
+            # this step's metadata (the transfers themselves are submitted in post_forward, after the replay is
+            # queued); no host wait, since _ws_kv_why keeps a flush on the stock path
+            self.kv_connector.pre_forward(so)
+            self._ws_kv_fin = (so.finished_req_ids,)
+            self._ws_counts["kv hooks"] = self._ws_counts.get("kv hooks", 0) + 1
         self._ws_streak += 1
         req_ids = sort_batch_req_ids(so.num_scheduled_tokens, so.scheduled_spec_decode_tokens, self.decode_query_len)
         slots = np.fromiter((self.req_states.req_id_to_index[r] for r in req_ids), dtype=np.intp, count=len(req_ids))
@@ -386,6 +428,8 @@ class WholeStepRunner(GPUModelRunner):
             sys.stderr.flush()
             torch.cuda.synchronize()
         g.graph.replay()
+        if self._ws_kv_fin is not None:
+            self.kv_connector.finish_forward()
         if key[0] == 1:
             self._k3b_pending += 1
         if pick is not None:
@@ -488,8 +532,16 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_pending = None
         from vllm.v1.outputs import ModelRunnerOutput
         from vllm.v1.worker.gpu.model_runner import AsyncOutput
+        kvo = None
+        if self._ws_kv_fin is not None:
+            # the stock sample_tokens' post-step connector work: queue this step's stores for the next step, poll the
+            # transfers' end events, report finished jobs to the scheduler (without the report a stored chunk never
+            # becomes loadable and a request waiting on a load is not resumed)
+            (fin,), self._ws_kv_fin = self._ws_kv_fin, None
+            kvo = self.kv_connector.post_forward(fin)
         mro = ModelRunnerOutput(req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
-                                sampled_token_ids=None, prompt_logprobs_dict={}, prompt_token_id_logprobs_dict={})
+                                sampled_token_ids=None, prompt_logprobs_dict={}, prompt_token_id_logprobs_dict={},
+                                kv_connector_output=kvo)
         h = self.draft_tokens_handler   # the scheduler gets placeholder drafts (no structured output here)
         h.req_ids, h.num_draft_tokens, h.draft_tokens_np = req_ids, K, None
         return AsyncOutput(model_runner_output=mro, sampler_output=g.sampler_output, num_sampled_tokens=g.num_sampled,
@@ -599,40 +651,98 @@ class WholeStepRunner(GPUModelRunner):
             return 0
         return sum(b["size"] for seg in self._ws_pool.snapshot() for b in seg["blocks"] if b["state"] == "inactive")
 
+    def _ws_pool_size(self):
+        """bytes the graph pool holds on the device: its segments (live graphs, blocks of evicted ones, the reserve)"""
+        if self._ws_pool is None:
+            return 0
+        return sum(seg["total_size"] for seg in self._ws_pool.snapshot())
+
+    def _ws_driver(self):
+        """device memory in use outside PyTorch's allocator, where the driver keeps the executable graphs. Free memory
+        alone also moves with the allocator's cache, which torch.cuda.graph empties as every capture begins"""
+        free, total = torch.cuda.mem_get_info(self.device)
+        return total - free - torch.cuda.memory_reserved(self.device)
+
+    def _ws_free(self):
+        """device memory a capture can draw on: what is free now plus the default pool's wholly free segments, which
+        torch.cuda.graph returns to the device when the capture begins (long prompts leave GBs of them cached)"""
+        free, _ = torch.cuda.mem_get_info(self.device)
+        dev = self.device.index or 0
+        return free + sum(seg["total_size"] for seg in torch.cuda.memory_snapshot(include_traces=False)
+                          if seg.get("device", dev) == dev and tuple(seg["segment_pool_id"]) == (0, 0)
+                          and seg["active_size"] == 0)
+
+    @contextlib.contextmanager
+    def _ws_graph_capture(self):
+        """vLLM's graph_capture() on the runner's own capture stream (see __init__)"""
+        from vllm.distributed import parallel_state as ps
+        if self._ws_stream is None:
+            with ps.graph_capture(device=self.device) as ctx:
+                yield ctx
+            return
+        ctx = ps.GraphCaptureContext(self._ws_stream)
+        with ps.get_tp_group().graph_capture(ctx), ps.get_pp_group().graph_capture(ctx), \
+                ps.get_dp_group().graph_capture(ctx):
+            yield ctx
+
     def _ws_pool_init(self):
         """the graphs' MemPool, with DSV41_WS_POOL_RESERVE_GB allocated and freed into it at once (the first capture runs
-        in the boot warm-up, while the device is still free), so later captures find blocks without the device"""
+        in the boot warm-up, while the device is still free), so later captures find blocks without the device. The
+        reserve is allocated on the capture stream: a block freed on another stream is invisible to the captures"""
         self._ws_pool = torch.cuda.MemPool()
+        if self._ws_one_stream:
+            self._ws_stream = torch.cuda.Stream(device=self.device)
         gb = float(os.environ.get("DSV41_WS_POOL_RESERVE_GB", "2"))
         if gb > 0:
-            with torch.cuda.use_mem_pool(self._ws_pool):
-                t = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8, device=self.device)
-            del t
+            with torch.cuda.stream(self._ws_stream) if self._ws_stream is not None else contextlib.nullcontext():
+                with torch.cuda.use_mem_pool(self._ws_pool):
+                    t = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8, device=self.device)
+                del t
         # the reserve counts against DSV41_WS_POOL_GB: graphs and reserve together stay in 1.4's envelope (on top of
         # it, the stock path's prefill indexer ran out of memory under agent traffic, 2026-11-12)
-        self._ws_pool_bytes += int(gb * (1 << 30))
-        _LOG(f"graph pool reserve {gb:g} GB ({self._ws_pool_free() >> 20} MiB free in the pool), counted in "
-             f"DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}")
+        _LOG(f"graph pool reserve {gb:g} GB (pool {self._ws_pool_size() >> 20} MiB, {self._ws_pool_free() >> 20} MiB "
+             f"free in it), counted in DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}; "
+             f"{'one capture stream' if self._ws_one_stream else 'a new stream per capture'}")
+
+    def _ws_need(self, key):
+        """the pool memory a capture of this key is expected to take (an upper estimate: scratch is shared)"""
+        return key[0] * (key[1] + 1) * self._ws_row_bytes + (16 << 20)
+
+    @staticmethod
+    def _ws_room_why(batch, need, pool_free, pool_size, driver, free, min_free, budget):
+        """the rule of _ws_room on plain numbers (bytes): None, or (reason, bytes the pool would grow by)"""
+        grow = max(0, need - pool_free)
+        if free < (1 << 30):   # 1.7: the stock path's prefill needs the last GB (the indexer asks ~0.5 GB at a time)
+            return "device", grow
+        if grow and free - grow < min_free:
+            return "pool", grow
+        if grow and batch > 1 and pool_size + driver + grow > budget:
+            return "budget", grow
+        return None
 
     def _ws_room(self, key, log=True):
         """None while a new graph fits, else the reason. Graphs live in one MemPool with a reserve taken at the first
         capture (DSV41_WS_POOL_RESERVE_GB), so a capture draws its blocks from the pool, not from what the caching
         allocator left on the device: long prompts can leave under 1 GB of device memory free for hours (#5, 1.4's
-        validation). The device must still hold the driver's executable graph (tens of MB), and the pool may grow
-        only while the device keeps DSV41_WS_MIN_FREE_MIB. Never torch.cuda.empty_cache() here: returning the
-        allocator's cached blocks to the device crashed the engine with an illegal address after evictions (twice,
-        2026-11-12)"""
-        free, _ = torch.cuda.mem_get_info()
-        pool_free = self._ws_pool_free()
+        validation). A capture that fits in the pool's free blocks (the reserve, evicted graphs) is always allowed.
+        One that would make the pool grow is allowed only while the device keeps DSV41_WS_MIN_FREE_MIB after the
+        growth and, at batch > 1, the pool and the executable graphs stay within DSV41_WS_POOL_GB; the device must
+        in any case hold the driver's executable graph (tens of MB). The pool is measured (its segments), not
+        tallied from free memory, which the allocator's cache moves by GBs. Never torch.cuda.empty_cache() here:
+        returning the allocator's cached blocks to the device crashed the engine with an illegal address after
+        evictions (twice, 2026-11-12)"""
+        free, need = self._ws_free(), self._ws_need(key)
+        pool_free, pool_size = self._ws_pool_free(), self._ws_pool_size()
+        r = self._ws_room_why(key[0], need, pool_free, pool_size, self._ws_driver_bytes, free, self._ws_min_free,
+                              self._ws_pool_budget)
         why = None
-        if free < (1 << 30):   # the stock path's prefill needs the last GB (the indexer asks ~0.5 GB at a time)
-            why = ("device", f"{free >> 20} MiB free on the device, below the 1 GiB kept for the stock path")
-        elif self._ws_pool is not None and pool_free < (256 << 20) and free < self._ws_min_free:
-            why = ("pool", f"{pool_free >> 20} MiB free in the graph pool and {free >> 20} MiB on the device "
-                           f"(DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20})")
-        elif key[0] > 1 and self._ws_pool_bytes >= self._ws_pool_budget:
-            why = ("budget", f"the graphs hold ~{self._ws_pool_bytes >> 20} MiB, "
-                             f"DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g}")
+        if r is not None:
+            state = (f"the pool holds {pool_size >> 20} MiB with {pool_free >> 20} free, the key needs about "
+                     f"{need >> 20} MiB, {free >> 20} MiB usable on the device")
+            why = (r[0], {"device": f"{free >> 20} MiB usable on the device, below the 1 GiB kept for the stock path",
+                          "pool": f"{state} (DSV41_WS_MIN_FREE_MIB={self._ws_min_free >> 20})",
+                          "budget": f"{state}, executable graphs {self._ws_driver_bytes / 2**20:.0f} MiB "
+                                    f"(DSV41_WS_POOL_GB={self._ws_pool_budget / (1 << 30):g})"}[r[0]])
         if why is not None and log and not self._ws_room_logged:
             self._ws_room_logged = True
             _LOG(f"{why[1]}: no more graphs are captured ({len(self._ws_graphs)} held); new keys such as {key} stay "
@@ -659,7 +769,7 @@ class WholeStepRunner(GPUModelRunner):
             return 0
         for _, k in idle:
             g = self._ws_graphs.pop(k)
-            self._ws_pool_bytes = max(0, self._ws_pool_bytes - g.bytes)
+            self._ws_driver_bytes -= g.driver   # its pool blocks stay in the pool, free for the next capture
             self._ws_retired.append(g)
         torch.cuda.synchronize()         # nothing idle that long is in flight; the GPU is idle after this
         for old in self._ws_retired:
@@ -712,7 +822,6 @@ class WholeStepRunner(GPUModelRunner):
                 scope[1]()
 
     def _ws_capture_inner(self, key, so):
-        from vllm.distributed.parallel_state import graph_capture
         from vllm.utils.torch_utils import current_stream
         g = _Graph(key)
         g.patches = StepPatches(self)
@@ -725,7 +834,8 @@ class WholeStepRunner(GPUModelRunner):
         if self._ws_pool is None:      # before free0: the reserve is not this graph's memory
             self._ws_pool_init()
         free0 = torch.cuda.mem_get_info()[0]
-        with graph_capture(device=self.device):
+        size0, used0, driver0 = self._ws_pool_size(), self._ws_pool_size() - self._ws_pool_free(), self._ws_driver()
+        with self._ws_graph_capture():
             s = current_stream()
             # this step for real, through the capturable path, on the capture stream (real async output)
             import vllm.utils.deep_gemm as vdg
@@ -759,9 +869,15 @@ class WholeStepRunner(GPUModelRunner):
             try:
                 if self._ws_pool is None:
                     self._ws_pool_init()
-                with g.patches.active("replay"), torch.cuda.graph(graph, stream=s, pool=self._ws_pool.id):
-                    super().execute_model(steady)
-                    ao = super().sample_tokens(None)
+                # the record step above ran the KV connector's hooks for real (its output is in rec); the capture
+                # pass must not run them again: a transfer submitted here would wait on the capturing stream
+                self.kv_connector.set_disabled(True)
+                try:
+                    with g.patches.active("replay"), torch.cuda.graph(graph, stream=s, pool=self._ws_pool.id):
+                        super().execute_model(steady)
+                        ao = super().sample_tokens(None)
+                finally:
+                    self.kv_connector.set_disabled(False)
             except Exception as e:   # the step above already ran for real: serve its output, keep this key stock
                 import traceback
                 self._ws_failed.add(key)
@@ -795,8 +911,12 @@ class WholeStepRunner(GPUModelRunner):
         self._ws_counts["capture"] += 1
         self._ws_eager_out = out
         free1 = torch.cuda.mem_get_info()[0]
-        g.bytes = max(0, free0 - free1)   # device memory: the executable graph plus any growth of the pool
-        self._ws_pool_bytes += g.bytes
+        size1, pool_free = self._ws_pool_size(), self._ws_pool_free()
+        g.bytes = size1 - pool_free - used0     # the pool blocks it holds
+        g.driver = self._ws_driver() - driver0  # signed: the sum over the live graphs is what counts
+        self._ws_driver_bytes += g.driver
         _LOG(f"captured {key} in {time.time() - t0:.2f} s; device free {free0 >> 20} -> {free1 >> 20} MiB, "
-             f"{len(self._ws_graphs)} graphs, pool ~{self._ws_pool_bytes >> 20} MiB")
+             f"{len(self._ws_graphs)} graphs, pool {size1 >> 20} MiB (grew {(size1 - size0) >> 20}, {pool_free >> 20} "
+             f"free), this graph {g.bytes / 2**20:.0f} MiB in the pool and {g.driver / 2**20:+.0f} MiB outside "
+             f"PyTorch (all graphs {self._ws_driver_bytes / 2**20:.0f})")
         return None

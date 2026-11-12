@@ -248,7 +248,12 @@ def agent(i, stop_at):
                 try:
                     json.loads(msg.get("content") or "")
                 except ValueError:
-                    if finish != "length":           # cut off at max_tokens: the client's limit, not a server fault
+                    # cut off at max_tokens or by one of the client's own stop strings (JSON whitespace may hold
+                    # "\n\n\n\n"): the client's limit, not a server fault
+                    if finish == "length" or (finish == "stop" and body.get("stop")):
+                        with lock:
+                            stats["json_cut_by_client"] = stats.get("json_cut_by_client", 0) + 1
+                    else:
                         note("bad-json", i, f"finish {finish}: {(msg.get('content') or '')[:200]!r}")
                 continue
             if usage:

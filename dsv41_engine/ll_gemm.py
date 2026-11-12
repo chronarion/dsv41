@@ -28,13 +28,19 @@ import tempfile
 LL_MAX_M = 8
 # (K, N) measured faster on cutedsl_low_latency at M <= 8 (ds41): wq_a + wkv, wq_b, wo_b
 LL_SHAPES = {(5120, 1792), (1280, 32768), (8192, 5120)}
-WIDE_MAX_M = 32 if os.environ.get("DSV41_LL_WIDE", "0") == "1" else 0
+# DSV41_LL_WIDE_MAX=64 adds 48- and 64-row tiles (batch 9-16 at 3 drafts; wq_b keeps the persistent kernel at 64)
+WIDE_MAX_M = int(os.environ.get("DSV41_LL_WIDE_MAX", "32")) if os.environ.get("DSV41_LL_WIDE", "0") == "1" else 0
 # (cta_k, ab_stages, sfb_tmem_stages, split_k) per (K, N) and activation tile; starting points from vLLM #63921's GB300
 # TP4 table (wq_a + wkv is the same shape; wq_b has 4x its N, wo_b 4x its K here), to be swept in the chain
 WIDE_TACTICS = {  # standalone L2-cold sweep 2026-11-05 (widell/test_wide_ll.py): us at M=16 / M=24 vs persistent
     (5120, 1792): {16: (128, 9, 1, 4), 32: (128, 8, 1, 4)},    # 3.89 / 4.60 vs 6.75 / 6.96
     (1280, 32768): {16: (128, 5, 1, 1), 32: (128, 5, 1, 1)},   # 8.11 / 8.27 vs 9.60 / 9.49 (bitwise: split 1)
     (8192, 5120): {16: (128, 10, 1, 2), 32: (128, 8, 1, 2)},   # 9.52 / 10.33 vs 11.25 / 11.44
+}
+WIDE_TACTICS_64 = {  # 2026-11-11 sweep (widell2/test_wide64.py), us at M = tile vs persistent
+    (5120, 1792): {48: (128, 6, 1, 4), 64: (128, 8, 1, 4)},    # 5.76 / 6.36 vs 10.20 / 10.16
+    (1280, 32768): {48: (128, 4, 1, 1)},                       # 9.29 vs 12.15; at 64 11.42 vs 11.60: persistent
+    (8192, 5120): {48: (128, 6, 1, 2), 64: (128, 8, 1, 2)},    # 11.99 / 12.26 vs 15.70 / 15.70
 }
 _wide_kernels = {}
 TARGET = "vllm.model_executor.kernels.linear.mxfp8.flashinfer"
@@ -128,6 +134,9 @@ def _wide_launch(compiled, weight, weight_scale, a, a_scale, out):
 
 def _wide_tactics():
     tac = {k: dict(v) for k, v in WIDE_TACTICS.items()}
+    if WIDE_MAX_M > 32:
+        for k, v in WIDE_TACTICS_64.items():
+            tac[k].update(v)
     # DSV41_LL_WIDE_TACTICS='{"8192x5120": {"16": [128, 8, 1, 4], "32": [128, 10, 1, 2]}}' (sweeps)
     for shape, by_tile in json.loads(os.environ.get("DSV41_LL_WIDE_TACTICS") or "{}").items():
         K, N = (int(x) for x in shape.split("x"))

@@ -28,7 +28,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
 | `dsv41.sh` | launcher: the RTX sidecar, then the server; `profiles/*.env` select the options |
 | `harness/` | the captured-step harness and the decode-path KLD tool used for every measurement |
-| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), the chat tokenizer patch (`tokenizer_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`) |
+| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), the chat tokenizer patch (`tokenizer_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`); the boot warm-up (`warm.py`) |
 
 ## Requirements
 
@@ -46,7 +46,9 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
       -d '{"model": "dsv41", "messages": [{"role": "user", "content": "Hello"}]}'
     ./dsv41.sh down
 
-The first boot JIT-compiles kernels (cached under `STATE`); later boots take about 8 minutes.
+The first boot JIT-compiles kernels (cached under `STATE`); later boots take about 8 minutes. Once the server answers,
+`dsv41.sh` sends a short warm-up (`bench/warm.py`, about 15 s) shaped like real client requests, so the first live
+requests already find their decode-step graphs (`DSV41_WARM=0` skips it).
 
 ## Profiles and measured speed
 
@@ -103,15 +105,15 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-11 on the release code (1.3).
+one GPU serves the API). Measured 2026-11-12 on the release code (1.4).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 366 | 1,261 | 1,894 |
-| context 64K | 356 | 1,265 | 1,836 |
-| context 128K | 365 | 1,229 | 1,838 |
+| context 0 | 368 | 1,264 | 1,887 |
+| context 64K | 355 | 1,249 | 1,831 |
+| context 128K | 363 | 1,264 | 1,873 |
 
-Prefill: 57,082 tok/s on a 32K prompt (time to first token 0.57 s), 56,969 tok/s on 128K (2.26 s). The GPU ran
+Prefill: 57,161 tok/s on a 32K prompt (time to first token 0.56 s), 57,530 tok/s on 128K (2.23 s). The GPU ran
 at its power cap during prefill, as in every prefill number here.
 
 The benchmark restarts each stream with the same long prompt, so at 64K-128K part of what it measures is how fast the
@@ -135,8 +137,15 @@ contents as tool results, contexts that grow past 200K tokens and are re-read fr
 sampling settings and `reasoning_effort` values, structured-output turns, and streams the client abandons midway.
 `bench/burst_check.py` sends 16 unique 30K-token prompts at once. On the release code: 12 agents for 8 minutes, 1,418 turns, contexts up
 to 144K tokens, 55 abandoned streams, no server error, hang or broken output; the burst check 16 of 16 correct. Before the
-fixes in this release, several long prompts arriving together crashed the server, and so did more than about 20
+fixes in 1.1, several long prompts arriving together crashed the server, and so did more than about 20
 concurrent requests.
+
+Each decode step at batch 8 or below replays a captured CUDA graph, one per combination of batch size, draft width and
+sampling options, and the graphs share a memory budget (`DSV41_WS_POOL_GB`, 6 GB). Until 1.4 the graphs captured first
+kept the budget for good, so on a server that first saw tests or benchmarks, live traffic with other sampling settings
+ran mostly on the slower uncaptured path (issue #5: 31% of steps replayed). Now a graph unused for two minutes
+(`DSV41_WS_IDLE_S`) is freed when a new one needs the room, a request shape refused for memory is retried after a
+minute, and the server log's step counters name those refusals.
 
 ## Credits
 
@@ -145,5 +154,5 @@ Most of this engine is a port of original-el8's DeepSeek-V4.1-Flash work for the
 The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT; see its `LICENSE`, `NOTICE` and
 `THIRD_PARTY.md`). This engine is built on vLLM (Apache-2.0) and uses b12x (Apache-2.0) in the sidecar.
 
-The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#4), including their
-root-cause analysis and proposed patches. The load and agent tests use Local Inference Lab's llm-inference-bench.
+The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#5), including their
+root-cause analysis, proposed patches and the warm-up script. The load and agent tests use Local Inference Lab's llm-inference-bench.

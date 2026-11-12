@@ -82,9 +82,17 @@ main() {
     --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256 \
     --override-generation-config '{"temperature": 1.0, "top_p": 0.95}' \
     --default-chat-template-kwargs '{"reasoning_effort":"high"}' \
+    ${DSV41_TORCH_PROFILE:+--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/vllm/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'} \
     --host 0.0.0.0 --port $PORT >/dev/null || return 1
   for i in $(seq 1 240); do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ] && { log "ready on :$PORT after $((i*15)) s"; return 0; }
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ]; then
+      log "ready on :$PORT after $((i*15)) s"
+      # whole-step graphs for the request shapes clients send (bench/warm.py); DSV41_WARM=0 skips it
+      if [ "${DSV41_WARM:-1}" = 1 ]; then
+        python3 -I "$E/bench/warm.py" "http://127.0.0.1:$PORT" >/dev/null 2>&1 && log "warmed" || log "warm-up failed (serving anyway)"
+      fi
+      return 0
+    fi
     [ "$(docker inspect -f '{{.State.Status}}' $NAME 2>/dev/null)" = running ] || { log "server died"; docker logs $NAME 2>&1 | tail -30; return 1; }
     sleep 15
   done

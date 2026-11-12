@@ -127,9 +127,11 @@ capping per-request draft widths at batches 7-8, where the cap saved no work (8 
 output detokenizer from decoding the whole prompt before a request's first token (46 ms at 128K): +2-3% prefill, and a
 repeated 128K prompt answers in 0.06 s.
 
-The `fast` profile (lossy, KLD 0.034; see Profiles) on 1.6: 1 request 398 / 395 / 382 tok/s at context 0 /
-64K / 128K, 8 requests 1,514 / 1,487 / 1,482, 16 requests 1,898 / 1,817 / 1,844, prefill 66.2K / 66.8K tok/s. Its lossy
-options apply inside the decode-step graphs (batches up to 8), so 16 requests run at the default profile's speed.
+The `fast` profile (lossy, KLD 0.034; see Profiles) on 1.9: 1 request 397 / 388 / 382 tok/s at context 0 / 64K /
+128K, 8 requests 1,517 / 1,480 / 1,434, 16 requests 2,270 / 2,085 / 2,054, prefill 65.5K / 65.3K tok/s. Since 1.9 its
+decode-step graphs, and with them its lossy options, cover batches up to 16 instead of 8 (16 requests +11 to +20%; decode
+KLD at batch 16 0.039). This needed 1.8's shared graph memory: before it, graphs up to batch 16 ran out of memory under
+agent traffic.
 
 The benchmark restarts each stream with the same long prompt, so at 64K-128K part of what it measures is how fast the
 server turns the chat request back into tokens. 1.3 tokenizes chat prompts in pieces split at the template's special

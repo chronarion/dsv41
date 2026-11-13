@@ -179,11 +179,18 @@ idle graphs stays off by default because the pool now rarely fills; `DSV41_WS_ID
 
 A short agent turn on a long cached conversation is computed in one step together with a 128-token replay of its last
 cached block. Up to 256 rows that step runs as a captured graph (about 40 ms to the first token); above it, uncaptured
-(about 90 ms), which happens once a turn adds more than about 120 tokens (issue #9). `EXTRA_CAPTURE_SIZES=384` adds
-one graph size, with the replay graphs kept at 128 and 256, and covers turns of up to about 250 new tokens: measured
-here, turns of 130-250 new tokens 89 -> 45 ms, the same for others, decode and prefill unchanged. It costs 11% of the KV
-cache (2.84M -> 2.52M tokens), so it is not the default. The server log's step-stats line times the uncaptured steps per
-reason ("stock steps since the last line").
+(about 90 ms), which happens once a turn adds more than about 120 tokens (issue #9). The same happens on Local Inference
+Lab's benchmark when 16 streams restart at 64K context (steps of 280-285 rows). `EXTRA_CAPTURE_SIZES` adds graph
+sizes, at a cost in KV cache, so the default leaves it off:
+
+| `EXTRA_CAPTURE_SIZES` | turns covered | measured | KV cache |
+|---|---|---|---|
+| (none) | up to ~120 new tokens | | 2.84M tokens |
+| `320` | up to ~190 | 16 requests at 64K: 1,800 -> 1,900 tok/s (+5.5%) | 2.64M (-7%) |
+| `384` | up to ~250 | turns of 130-250 new tokens: 89 -> 45 ms to the first token | 2.50M (-12%) |
+
+Other cells and prefill are unchanged. `CAPTURE_SIZES` replaces the whole list. The server log's step-stats line times
+the uncaptured steps per reason ("stock steps since the last line").
 
 ## Credits
 

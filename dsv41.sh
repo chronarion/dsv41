@@ -86,8 +86,7 @@ main() {
     --tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-auto-tool-choice \
     --long-prefill-token-threshold 6144 --enable-prefix-caching \
     --speculative-config "$SPEC" \
-    --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256 ${EXTRA_CAPTURE_SIZES:-} \
-    ${EXTRA_CAPTURE_SIZES:+--compilation-config '{"decoder_replay_trim_threshold": 257, "decoder_replay_cudagraph_capture_sizes": [128, 256]}'} \
+    --cudagraph-capture-sizes ${CAPTURE_SIZES:-1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256} ${EXTRA_CAPTURE_SIZES:-} \
     ${KV_OFFLOAD_GB:+--kv-offloading-backend native --kv-offloading-size $KV_OFFLOAD_GB} \
     --override-generation-config '{"temperature": 1.0, "top_p": 0.95}' \
     --default-chat-template-kwargs '{"reasoning_effort":"high"}' \

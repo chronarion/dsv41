@@ -80,7 +80,7 @@ main() {
     --tensor-parallel-size 1 --moe-backend deep_gemm_mega_moe --enable-expert-parallel \
     --worker-cls dsv41_engine.worker.DSV41Worker \
     --engram-config '{"cpu_offload": true, "use_thp": true}' --max-model-len $MAXLEN --max-num-seqs 32 \
-    --max-num-batched-tokens 8192 --gpu-memory-utilization 0.95 --kv-cache-dtype nvfp4_ds_mla --block-size 128 \
+    --max-num-batched-tokens 8192 --gpu-memory-utilization ${GPU_MEM_UTIL:-0.95} --kv-cache-dtype nvfp4_ds_mla --block-size 128 \
     --attention-config '{"indexer_kv_dtype": "mxfp4", "indexer_sparse_logits": true}' \
     --kernel-config '{"enable_flashinfer_autotune": false}' \
     --tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-auto-tool-choice \

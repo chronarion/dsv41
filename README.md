@@ -195,7 +195,11 @@ sizes, at a cost in KV cache, so the default leaves it off:
 | `320` | up to ~190 | 16 requests at 64K: 1,800 -> 1,900 tok/s (+5.5%) | 2.64M (-7%) |
 | `384` | up to ~250 | turns of 130-250 new tokens: 89 -> 45 ms to the first token | 2.50M (-12%) |
 
-Other cells and prefill are unchanged. `CAPTURE_SIZES` replaces the whole list. The server log's step-stats line times
+Other cells and prefill are unchanged. `CAPTURE_SIZES` replaces the whole list. Since 1.8 the decode-step graphs use
+little of the memory kept outside vLLM's budget, so the graphs can also be paid for from that headroom instead of the KV
+cache: `EXTRA_CAPTURE_SIZES=320 GPU_MEM_UTIL=0.952` kept 2.86M tokens of KV and passed the full validation (agent stress
+included), but on the standard benchmark the 9 decode cells summed the same as without it (10,745 vs 10,766 tok/s),
+so it stays an option. The server log's step-stats line times
 the uncaptured steps per reason ("stock steps since the last line").
 
 ## Reproducibility

@@ -11,27 +11,6 @@ The default profile is lossless. It runs at the official precision (FP4 experts,
 logits match the official inference code on the same weights, with KLD at the run-to-run noise floor. Lossy options
 are separate profiles. Each one lists the speed it buys and the KLD it adds against that reference.
 
-## What is in here
-
-| path | what |
-|---|---|
-| `dsv41_engine/runner.py` | whole-step runner: every decode step (input prep, target forward, LM head, rejection, drafter) replays one captured CUDA graph per (batch, draft width, sampler branch) |
-| `dsv41_engine/conf_width.py` | per-step verify width from the current drafts' confidences. At batch 1 the runner replays a graph of exactly that many drafts (one per width); at batch 2 and up each request's rows beyond its width are masked inside the graph, skipping their experts. Stops at the first position it refuses, so the output distribution is unchanged |
-| `dsv41_engine/replay_skip.py` | intermediate prefill chunks skip the decoder replay nothing reads |
-| `dsv41_engine/prefill_indices.py` | fixes a vLLM 0.32 bug: sparse prefill read stale index rows, which put NaN into short requests batched with a long one |
-| `dsv41_engine/sampler_scratch.py` | fixes a vLLM 0.32 bug: the top-k sampler's scratch buffer was freed when a larger batch replaced it, while graphs captured earlier kept writing into it (dormant with this server's traffic, where the first use already creates the largest buffer) |
-| `dsv41_engine/dynk.py` | ds41's DynK estimator (5 or 7 drafts per batch-1 step); off in the shipped profiles, which use `conf_width.py` |
-| `dsv41_engine/suffix.py` | copy (suffix) drafting: when the request's history repeats, batch-1 steps verify 31 copied tokens (one-hot draft distribution, so the output distribution is unchanged) |
-| `dsv41_engine/{ll_gemm,dflash_prep,fp8_head,capture,worker}.py` | low-latency MXFP8 GEMMs (pinned tactics at M <= 8; FlashInfer's low-latency kernel compiled with 16/32-row tiles for 8 < M <= 32, after vLLM #63921), drafter input prep, the optional FP8 verify head, capture helpers, the vLLM worker |
-| `kernels/vendor/ds41/fastpath/hook/warm_adapt.py` | warm experts that follow the text: at prefill, the 48 warm slots of layers 0-19 hold the cold experts the current prompts use most (weights copied in from host memory), so fewer rows wait for the RTX |
-| `kernels/vendor/ds41/fastpath/hook/rowmap-warm-v2.json` | the expert split: 256 hot experts per layer in GB300 HBM, 128 cold on the RTX, 48 of the cold ones on layers 0-19 also in HBM for prefill (warm; `rowmap-warm-v1.json`: 24 on every layer) |
-| `kernels/vendor/ds41` | ds41's kernels and vLLM components (MIT) with our vLLM 0.32 ports and changes; `VENDORED.md` lists every change |
-| `kernels/vendor/b12x` | b12x (Apache-2.0), used by the RTX sidecar |
-| `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
-| `dsv41.sh` | launcher: the RTX sidecar, then the server; `profiles/*.env` select the options |
-| `harness/` | the captured-step harness and the decode-path KLD tool used for every measurement |
-| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), the chat tokenizer patch (`tokenizer_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`); the boot warm-up (`warm.py`) |
-
 ## Requirements
 
 - DGX Station GB300 (GB300 + RTX PRO 6000), Docker with the NVIDIA Container Toolkit's CDI devices
@@ -211,6 +190,36 @@ logits differ in their last bits and a near-tie between two tokens can flip (iss
 prefill computes on the GB300 also depend on the prompts prefilled before, so a cold prompt is no longer bit-identical
 from run to run either. `DSV41_WARM_ADAPT=0` restores the fixed set of 1.9 and with it run-to-run reproducible cold
 prefill.
+
+## Layout
+
+- `dsv41.sh` starts the server (with `profiles/*.env` choosing the options); `build.sh` builds the kernels once.
+- `dsv41_engine/` is the engine: the decode-step graphs, speculative decoding and the vLLM fixes.
+- `kernels/vendor/` holds the kernels this builds on (ds41, b12x), with every change listed in `VENDORED.md`.
+- `bench/` and `harness/` are the correctness checks and measurement tools used for the numbers above.
+
+<details><summary>File by file</summary>
+
+| path | what |
+|---|---|
+| `dsv41_engine/runner.py` | whole-step runner: every decode step (input prep, target forward, LM head, rejection, drafter) replays one captured CUDA graph per (batch, draft width, sampler branch) |
+| `dsv41_engine/conf_width.py` | per-step verify width from the current drafts' confidences. At batch 1 the runner replays a graph of exactly that many drafts (one per width); at batch 2 and up each request's rows beyond its width are masked inside the graph, skipping their experts. Stops at the first position it refuses, so the output distribution is unchanged |
+| `dsv41_engine/replay_skip.py` | intermediate prefill chunks skip the decoder replay nothing reads |
+| `dsv41_engine/prefill_indices.py` | fixes a vLLM 0.32 bug: sparse prefill read stale index rows, which put NaN into short requests batched with a long one |
+| `dsv41_engine/sampler_scratch.py` | fixes a vLLM 0.32 bug: the top-k sampler's scratch buffer was freed when a larger batch replaced it, while graphs captured earlier kept writing into it (dormant with this server's traffic, where the first use already creates the largest buffer) |
+| `dsv41_engine/dynk.py` | ds41's DynK estimator (5 or 7 drafts per batch-1 step); off in the shipped profiles, which use `conf_width.py` |
+| `dsv41_engine/suffix.py` | copy (suffix) drafting: when the request's history repeats, batch-1 steps verify 31 copied tokens (one-hot draft distribution, so the output distribution is unchanged) |
+| `dsv41_engine/{ll_gemm,dflash_prep,fp8_head,capture,worker}.py` | low-latency MXFP8 GEMMs (pinned tactics at M <= 8; FlashInfer's low-latency kernel compiled with 16/32-row tiles for 8 < M <= 32, after vLLM #63921), drafter input prep, the optional FP8 verify head, capture helpers, the vLLM worker |
+| `kernels/vendor/ds41/fastpath/hook/warm_adapt.py` | warm experts that follow the text: at prefill, the 48 warm slots of layers 0-19 hold the cold experts the current prompts use most (weights copied in from host memory), so fewer rows wait for the RTX |
+| `kernels/vendor/ds41/fastpath/hook/rowmap-warm-v2.json` | the expert split: 256 hot experts per layer in GB300 HBM, 128 cold on the RTX, 48 of the cold ones on layers 0-19 also in HBM for prefill (warm; `rowmap-warm-v1.json`: 24 on every layer) |
+| `kernels/vendor/ds41` | ds41's kernels and vLLM components (MIT) with our vLLM 0.32 ports and changes; `VENDORED.md` lists every change |
+| `kernels/vendor/b12x` | b12x (Apache-2.0), used by the RTX sidecar |
+| `build.sh` | builds the kernels inside the vLLM 0.32 image and assembles `runtime/` |
+| `dsv41.sh` | launcher: the RTX sidecar, then the server; `profiles/*.env` select the options |
+| `harness/` | the captured-step harness and the decode-path KLD tool used for every measurement |
+| `bench/` | correctness checks: request order (`order_check.py`), the request options (`api_check.py`), the chat tokenizer patch (`tokenizer_check.py`), top-p inside batch-2 graphs (`topp_check.py`), several long prompts at once (`burst_check.py`), simulated coding agents (`agent_stress.py`); the boot warm-up (`warm.py`) |
+
+</details>
 
 ## Credits
 

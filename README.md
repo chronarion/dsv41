@@ -231,3 +231,24 @@ The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT;
 The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#5), including their
 root-cause analysis, proposed patches and the warm-up script; the shared graph pool (#7) and graph replay under KV
 offload (#8) in 1.8 are their patches. The load and agent tests use Local Inference Lab's llm-inference-bench.
+
+Ideas from published work:
+
+- Speculative decoding, where a small drafter proposes tokens and the model checks several at once without changing
+  the output distribution: Leviathan, Kalman & Matias, [Fast Inference from Transformers via Speculative
+  Decoding](https://arxiv.org/abs/2211.17192), and Chen et al., [Accelerating Large Language Model Decoding with
+  Speculative Sampling](https://arxiv.org/abs/2302.01318).
+- Checking the drafts as a block rather than one token at a time (`rejection_sample_method: block`): Sun et al.,
+  [Block Verification Accelerates Speculative Decoding](https://arxiv.org/abs/2403.10444).
+- The drafter, and choosing how many drafts to check each step from its confidence head: Cheng et al.,
+  [DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive
+  Generation](https://arxiv.org/abs/2607.05147).
+- Copy drafting from the request's own history: Oliaro et al., [SuffixDecoding](https://arxiv.org/abs/2411.04975).
+- Keeping frequently used experts on the fast device and the rest elsewhere: [PowerInfer](https://arxiv.org/abs/2312.12456),
+  [Fiddler](https://arxiv.org/abs/2402.07033) and [HybriMoE](https://arxiv.org/abs/2504.05897). Moving experts between
+  the devices at run time from the current workload, as the warm slots do since 1.10, is also the idea of
+  [DALI](https://arxiv.org/abs/2602.03495).
+- The `fast` profile's dropped expert picks, chosen per batch: Gupta et al., [Lynx: Enabling Efficient MoE Inference
+  through Dynamic Batch-Aware Expert Selection](https://arxiv.org/abs/2411.08982).
+- Prefetching the shared expert's weights while the GPU waits on something else (`DSV41_SHARED_PF`): Yüzügüler,
+  Zhuang & Cavigelli, [PRESERVE](https://arxiv.org/abs/2501.08192).

@@ -151,3 +151,11 @@ reference-class gates, with changes noted per file.
   the Triton gather and in the stock fallback. When a batch shrinks (2 requests drafting 5 to 1 request scheduled for 7),
   vLLM's `-1` draft placeholders reach `input_ids`; the verifier stops at them, but the gather read `weight[-1]`, 10 KB
   before the table (an MMU fault, Xid 31, on driver 620). Outputs unchanged.
+- Warm experts that follow the text (2026-11-12, 1.10; `DSV41_WARM_ADAPT=1` in the default profile): new
+  `fastpath/hook/warm_adapt.py`; `fastpath/hook/mega_peer_hook.py` keeps the raw weights of every cold expert of the
+  warm layers (0-19) on the CPU at load, and in the prefill path (T > FUSED_MAX, outside graph capture, T >= 2048)
+  transforms them once into MegaMoE's layout in pinned host memory (self-check against the boot's warm rows), counts
+  rows per cold expert each call (one scatter-add, no host sync) and, from the previous call's counts, swaps up to 24
+  warm slots per call (weights copied into the slot, prefill row map updated, both on the stream). Decode, the decode
+  row map and the RTX sidecar are unchanged. Also `DSV41_COLD_DUMP=dir`: a measurement switch that saves each prefill
+  call's cold picks (off by default; syncs every layer).

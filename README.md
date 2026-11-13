@@ -23,6 +23,7 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
 | `dsv41_engine/dynk.py` | ds41's DynK estimator (5 or 7 drafts per batch-1 step); off in the shipped profiles, which use `conf_width.py` |
 | `dsv41_engine/suffix.py` | copy (suffix) drafting: when the request's history repeats, batch-1 steps verify 31 copied tokens (one-hot draft distribution, so the output distribution is unchanged) |
 | `dsv41_engine/{ll_gemm,dflash_prep,fp8_head,capture,worker}.py` | low-latency MXFP8 GEMMs (pinned tactics at M <= 8; FlashInfer's low-latency kernel compiled with 16/32-row tiles for 8 < M <= 32, after vLLM #63921), drafter input prep, the optional FP8 verify head, capture helpers, the vLLM worker |
+| `kernels/vendor/ds41/fastpath/hook/warm_adapt.py` | warm experts that follow the text: at prefill, the 48 warm slots of layers 0-19 hold the cold experts the current prompts use most (weights copied in from host memory), so fewer rows wait for the RTX |
 | `kernels/vendor/ds41/fastpath/hook/rowmap-warm-v2.json` | the expert split: 256 hot experts per layer in GB300 HBM, 128 cold on the RTX, 48 of the cold ones on layers 0-19 also in HBM for prefill (warm; `rowmap-warm-v1.json`: 24 on every layer) |
 | `kernels/vendor/ds41` | ds41's kernels and vLLM components (MIT) with our vLLM 0.32 ports and changes; `VENDORED.md` lists every change |
 | `kernels/vendor/b12x` | b12x (Apache-2.0), used by the RTX sidecar |
@@ -38,6 +39,8 @@ are separate profiles. Each one lists the speed it buys and the KLD it adds agai
   UUIDs to override it.
 - Images `vllm/vllm-openai:v0.32.0-aarch64` (server) and `vllm/vllm-openai:v0.31.0` (sidecar).
 - The checkpoint `deepseek-ai/DeepSeek-V4.1-Flash-1017` at `MODEL` (a directory of real files).
+- About 46 GB of free host memory beyond the sidecar's, for copies of the cold experts that prefill can move onto the
+  GB300 (1.10 and later; `DSV41_WARM_ADAPT=0` turns this off).
 
 ## Run
 
@@ -112,16 +115,19 @@ the default.
 [Local Inference Lab's](https://github.com/local-inference-lab/llm-inference-bench) standard benchmark (`lil-bench`,
 standard/1), default profile, run inside the server container with
 `python3 -m lil_bench --no-upload --no-p2pmark --url http://127.0.0.1:8106` (llm-inference-bench 1.7.1; p2pmark skipped:
-one GPU serves the API). Measured 2026-11-12 on the release code (1.8).
+one GPU serves the API). Measured 2026-11-12 on the release code (1.10).
 
 | | 1 request | 8 requests (agg) | 16 requests (agg) |
 |---|---:|---:|---:|
-| context 0 | 373 | 1,332 | 1,948 |
-| context 64K | 370 | 1,329 | 1,868 |
-| context 128K | 359 | 1,341 | 1,889 |
+| context 0 | 378 | 1,338 | 1,933 |
+| context 64K | 374 | 1,330 | 1,843 |
+| context 128K | 364 | 1,339 | 1,867 |
 
-Prefill: 65,851 tok/s on a 32K prompt (time to first token 0.49 s), 66,128 tok/s on 128K (1.94 s). The GPU ran
-at its power cap during prefill, as in every prefill number here. 1.5 moved the cold experts that prefill computes on
+Prefill: 75,035 tok/s on a 32K prompt (time to first token 0.43 s), 76,475 tok/s on 128K (1.68 s). 1.10 lets the 48 warm
+expert slots of the prefill layers follow the text: each prefill step counts how many rows every cold expert received and
+the next step moves the most-used ones onto the GB300, copying their weights in from host memory. Before, a fixed set
+chosen on a tuning corpus left more than half of this text's rows with a cold expert waiting for the RTX; now about one
+in twenty: prefill +14-16% (65.9K / 66.1K in 1.8). Decode is unchanged; it never uses the warm slots. 1.5 moved the cold experts that prefill computes on
 the GB300 to the layers that prefill runs in full (+11-12%; the RTX was holding the GB300 up on this text), and stopped
 capping per-request draft widths at batches 7-8, where the cap saved no work (8 requests +4-6%). 1.6 stopped the
 output detokenizer from decoding the whole prompt before a request's first token (46 ms at 128K): +2-3% prefill, and a
@@ -191,6 +197,16 @@ sizes, at a cost in KV cache, so the default leaves it off:
 
 Other cells and prefill are unchanged. `CAPTURE_SIZES` replaces the whole list. The server log's step-stats line times
 the uncaptured steps per reason ("stock steps since the last line").
+
+## Reproducibility
+
+Greedy output (temperature 0) is deterministic for a given path through the server, but not across paths. A prompt
+that hits the prefix cache recomputes only its last cached block, while a cold prompt is computed in 8K-token chunks; the
+different row counts change which GPU computes which expert and the summation order of some matrix products, so the
+logits differ in their last bits and a near-tie between two tokens can flip (issue #10). Since 1.10 the experts that
+prefill computes on the GB300 also depend on the prompts prefilled before, so a cold prompt is no longer bit-identical
+from run to run either. `DSV41_WARM_ADAPT=0` restores the fixed set of 1.9 and with it run-to-run reproducible cold
+prefill.
 
 ## Credits
 

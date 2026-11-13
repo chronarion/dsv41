@@ -88,6 +88,7 @@ class ColdState:
         self.row_map = None   # int32 [E] on device, built at finalize
         self.row_map_static = None  # the same with the warm experts hot (prefill), or None without warm experts
         self.warm_row_map = None  # dsv41 J1b: int32 [E] MegaMoE row of each warm expert, else -1 (router redirect)
+        self.adapt = None         # dsv41 warm_adapt.Adapt: warm slots that follow the text (DSV41_WARM_ADAPT=1)
 
 
 def _target_layer(prefix: str, num_experts: int, num_local_experts: int):
@@ -117,6 +118,8 @@ def _init(self, vllm_config, *, num_experts, num_local_experts, experts_start_id
     _orig["init"](self, vllm_config, num_experts=n_rows, num_local_experts=n_rows,
                   experts_start_idx=0, **kw)
     self._mp = ColdState(idx, split["hot"], split["cold"], split["warm"])
+    if _WARM_ADAPT and split["warm"]:
+        self._mp.adapt = _warm_adapt().Adapt(self._mp)
     if idx == 0:
         _LOG(f"layer 0 ({kw.get('prefix')}): {n_hot} hot experts in MegaMoE, "
              f"{E - n_hot} cold in the RTX sidecar"
@@ -131,6 +134,12 @@ def _weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id,
         return _orig["weight_loader"](self, param, loaded_weight, weight_name, shard_id,
                                       expert_id, return_success)
     r = st.row[expert_id]
+    if r < 0 and st.adapt is not None:   # dsv41 warm_adapt: every cold expert's raw weights, kept on the CPU
+        key = {id(self.w13_weight): "w13", id(self.w13_weight_scale): "w13s", id(self.w2_weight): "w2",
+               id(self.w2_weight_scale): "w2s"}.get(id(param))
+        ok = (shard_id in ("w1", "w3") and "w13_" in weight_name) or (shard_id == "w2" and "w2_" in weight_name)
+        if key is not None and ok:
+            st.adapt.stash(key, param, -r - 1, shard_id, self.intermediate_size, loaded_weight)
     if r < 0:
         r = st.warm_row.get(expert_id, -1)  # dsv41 J1a: a warm expert also lives in MegaMoE
     if r < 0:
@@ -224,6 +233,34 @@ def _fused2():
     return _pf2
 
 
+_WARM_ADAPT = os.environ.get("DSV41_WARM_ADAPT", "0") == "1"
+_wa = None
+
+
+def _warm_adapt():
+    global _wa
+    if _wa is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import warm_adapt
+
+        _wa = warm_adapt
+    return _wa
+
+
+_COLD_DUMP = os.environ.get("DSV41_COLD_DUMP", "")   # directory; measurement only (syncs every prefill layer)
+_cold_n = [0]
+
+
+def _cold_dump(st, topk_ids, valid):
+    if _cold_n[0] >= int(os.environ.get("DSV41_COLD_DUMP_MAX", "2000")) or torch.cuda.is_current_stream_capturing():
+        return
+    rm = st.row_map[topk_ids.clamp_min(0).long()]
+    cold = torch.where(valid & (rm < 0), -rm - 1, -1).to(torch.int16).cpu()
+    os.makedirs(_COLD_DUMP, exist_ok=True)
+    torch.save({"layer": st.idx, "cold": cold}, os.path.join(_COLD_DUMP, f"c{_cold_n[0]:05d}.pt"))
+    _cold_n[0] += 1
+
+
 def _forward(self, hidden_states, topk_weights, topk_ids, *, activation_clamp, fast_math=True):
     st = getattr(self, "_mp", None)
     if st is None:
@@ -243,11 +280,20 @@ def _forward(self, hidden_states, topk_weights, topk_ids, *, activation_clamp, f
         pf2.finish2(peer2, y, has, pos, rows)
         return y
 
+    ad = st.adapt if st.adapt is not None and T >= _warm_adapt().MIN_T and \
+        not torch.cuda.is_current_stream_capturing() else None
+    if ad is not None:   # dsv41 warm_adapt: transform once, then swap slots from the previous call's counts
+        ad.setup(self)
+        ad.before(self, T)
     valid = topk_ids >= 0
     rmap = st.row_map_static if st.row_map_static is not None else st.row_map  # dsv41 J1a: warm hot at prefill
     rm = rmap[topk_ids.clamp_min(0).long()]
     hot_ids = torch.where(valid & (rm >= 0), rm, -1).to(topk_ids.dtype)
     cold_ids = torch.where(valid & (rm < 0), -rm - 1, -1).to(torch.int32)
+    if ad is not None:
+        ad.after(topk_ids, valid)
+    if _COLD_DUMP:   # dsv41 measurement (Fable r13 M3): every prefill call's cold picks under the decode row map
+        _cold_dump(st, topk_ids, valid)
     xq, xs = _quant(hidden_states)
     has, pos, rows = peer2.send(xq, xs, cold_ids, topk_weights, st.idx)
     y = _orig["forward"](self, hidden_states, topk_weights, hot_ids,

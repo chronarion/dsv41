@@ -2,8 +2,9 @@
 
 A server for DeepSeek-V4.1-Flash-1017 that speaks the OpenAI API and runs on one DGX Station GB300. Most of the model
 lives in the GB300's 252 GB of memory; the experts that do not fit run on the station's second GPU, the RTX PRO 6000.
-Thinking, tool calls and contexts up to 1M tokens work. It is built on vLLM 0.32 and the ds41 kernels, and is mostly a
-port of [original-el8's work](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash).
+Thinking, tool calls and contexts up to 1M tokens work. It is built on top of
+[original-el8's work](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash), with
+vLLM 0.32 and the ds41 kernels.
 
 On Local Inference Lab's standard benchmark it generates about 375 tokens per second for one request, about 1,340 in
 total for 8 requests and about 1,900 for 16, and reads prompts at 75,000-76,000 tokens per second.
@@ -237,7 +238,7 @@ repeatable again.
 
 ## Credits
 
-Most of this engine is a port of original-el8's DeepSeek-V4.1-Flash work for the DGX Station GB300
+This engine is built on top of original-el8's DeepSeek-V4.1-Flash work for the DGX Station GB300
 ([original-el8/dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash)).
 The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT; see its `LICENSE`, `NOTICE` and
 `THIRD_PARTY.md`). This engine is built on vLLM (Apache-2.0) and uses b12x (Apache-2.0) in the sidecar.

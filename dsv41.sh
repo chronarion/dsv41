@@ -29,14 +29,26 @@ down() {
   log "down"
 }
 
-sidecar() {
-  mkdir -p $STATE/{sidecar-logs,b12x}
-  # runtime/ is build output: after `git pull` it can be older than the checkout (#6: a new row map in the profile)
+hook_check() {
+  # runtime/ is build output: after `git pull` it can be older than the checkout (#6: a new row map in the profile;
+  # #13: a 1.9 mega_peer_hook.py without warm_adapt.py ran 1.10 with warm adapt silently off). Every file the checkout
+  # ships in its hook directory must be in runtime/hook byte for byte; extra files there (local row maps) are fine.
   if [ ! -f "$RUNTIME/hook/$ROWMAP" ]; then
     log "runtime/hook has no $ROWMAP: runtime/ is older than the checkout; run ./build.sh"; return 1
   fi
-  diff -rq "$E/kernels/vendor/ds41/fastpath/hook" "$RUNTIME/hook" >/dev/null 2>&1 \
-    || log "warning: runtime/hook differs from the checkout (kernels/vendor/ds41/fastpath/hook); run ./build.sh after updating"
+  local src="$E/kernels/vendor/ds41/fastpath/hook" f rel stale=""
+  while IFS= read -r -d '' f; do
+    rel=${f#"$src/"}
+    cmp -s "$f" "$RUNTIME/hook/$rel" || stale="$stale $rel"
+  done < <(find "$src" -type f -not -path '*/__pycache__/*' -print0)
+  if [ -n "$stale" ]; then
+    log "runtime/hook is older than the checkout (missing or different:$stale); run ./build.sh"; return 1
+  fi
+}
+
+sidecar() {
+  mkdir -p $STATE/{sidecar-logs,b12x}
+  hook_check || return 1
   log "starting the RTX sidecar"
   docker run -d --name $NAME-sidecar --restart no --device nvidia.com/gpu=$RTX --ipc host --network none \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 \
@@ -57,6 +69,7 @@ sidecar() {
 
 main() {
   mkdir -p $STATE/{vllm,flashinfer,peer3-build} $STATE/jit/{tilelang,triton,nv,dj}
+  hook_check || return 1   # the GB300 container mounts runtime/hook as /w too
   log "starting the GB300 server: profile $PROFILE, port $PORT, max model length $MAXLEN"
   docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --security-opt label=disable \
@@ -69,6 +82,7 @@ main() {
     -v $E/patches/vllm/sampling_params.py:/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py:ro \
     -v $E/patches/vllm/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v41.py:ro \
     -v $E/patches/vllm/detokenizer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/detokenizer.py:ro \
+    -v $E/patches/vllm/parser_deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v41.py:ro \
     $(env | grep -o "^DSV41_[A-Z0-9_]*" | sed "s/^/-e /" | tr "\n" " ") \
     -v $RUNTIME/hook:/w:ro -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro \

@@ -111,7 +111,8 @@ Step time at 1 request, and KLD added on top of the default.
 Every release runs the same checks: a set of questions with known answers, tool calls with thinking on and off, the same
 prompts answered alone and among other requests, every request option, 16 long prompts at once, Local Inference Lab's
 scheduler tests (bursts, agents, overload), 12 simulated coding agents for 8 minutes, and the standard benchmark. The
-1.10 run: all pass, 1,255 agent turns with no error, hang or broken output.
+1.11 run (both profiles): all pass; the one request the agent test saw refused is the literal image token that 1.11
+rejects on purpose (issue #11). The 1.10 run: all pass, 1,255 agent turns with no error, hang or broken output.
 
 <details><summary>Details</summary>
 
@@ -140,6 +141,8 @@ Set them in the environment when starting, for example `KV_OFFLOAD_GB=32 MODEL=.
 | `DSV41_WARM_ADAPT=0` | keeps a fixed set of experts on the GB300 for prompt reading: no 46 GB of CPU memory, and repeatable output (see Reproducibility), but prompt reading about 13% slower |
 | `GPU_MEM_UTIL` | the share of GPU memory vLLM may use (default 0.95) |
 | `DSV41_WARM=0` | skips the 15-second warm-up after start |
+| `DSV41_WS_OUTPUT_CHECK=log` | when a prebuilt step's tokens fail the check (issue #10), report and continue instead of stopping the server (`0` turns the check off) |
+| `VLLM_DSV41_STRUCTURAL_DSML=0` | goes back to vLLM's stock tool-call parser (issue #12) |
 
 <details><summary>Short agent turns and EXTRA_CAPTURE_SIZES</summary>
 
@@ -203,6 +206,15 @@ repeatable again.
   turns it on; `DSV41_WS_ONE_STREAM=0` restores the old way). Steps also keep their speed with `KV_OFFLOAD_GB` (issue #8).
 - 1.9 lets `fast` use prebuilt steps up to 16 requests (+11 to +20% at 16).
 - 1.10 lets the copies on the GB300 follow the prompt being read: +14-16% prompt reading.
+- 1.11 fixes four reported problems. Issue #10: a prebuilt step's sampled tokens were copied back to the CPU while the
+  next step could already reuse their memory, so under some loads the server returned corrupt token ids; the copy now
+  finishes before the next step starts (no measurable cost), and every step's tokens are checked before they are used.
+  Issue #11: in thinking mode, a conversation with tool calls sent without its tool list lost the reasoning of the turn
+  that called the tool (vLLM's later fix, backported); with the same fix, message text that contains the literal
+  image token `<｜deepseek_image｜>`, tool results included, is rejected with HTTP 400, as DeepSeek's reference encoder
+  does (send images as image content parts; escape the token in file contents an agent passes back). Issue #12: a tool argument that contains DSML's own closing tags,
+  such as a file about DSML, is no longer cut short. Issue #13: the server refuses to start with build output older
+  than the checkout, instead of running with features silently off.
 
 </details>
 
@@ -245,7 +257,9 @@ The kernels and most vLLM components come from ds41 (`kernels/vendor/ds41`, MIT;
 
 The fixes for crashes under concurrent and agent traffic follow shieldstar's issue reports (#1-#5), including their
 root-cause analysis, proposed patches and the warm-up script; the shared graph pool (#7) and graph replay under KV
-offload (#8) in 1.8 are their patches. The load and agent tests use Local Inference Lab's llm-inference-bench.
+offload (#8) in 1.8 are their patches. 1.11's fixes follow shieldstar's and ebfio's reports: #10 (the corrupt-token
+bisect and log analysis), #11 (vLLM #62199, backported), #12 (J-M-Recipes' structural DSML parser overlay, Apache-2.0,
+mounted unchanged; see `patches/vllm/README.md`) and #13. The load and agent tests use Local Inference Lab's llm-inference-bench.
 
 Ideas from published work:
 

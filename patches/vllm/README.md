@@ -38,3 +38,24 @@ detokenizer's decode stream is primed with the prompt's last 64 tokens instead o
 everything it was primed with (46 ms at 157K tokens) on the API server's output loop, which serves every stream; the
 generated text is the same (checked on 1,672 prompt / continuation pairs, `skip_special_tokens` on and off).
 
+
+`deepseek_v41.py` and `deepseek_v41_encoding.py` also carry the two code hunks of vLLM #62199 (merged 2026-10-19,
+after 0.32; marked `vLLM #62199`), issue #11: in thinking mode, a user message that holds only tool results no longer
+starts a new turn, so a request with tool-call history but no `tools` keeps the reasoning of the assistant turn that
+made the call (it rendered `<｜Assistant｜></think>` instead of `<｜Assistant｜><think>...</think>`); and a literal
+`<｜deepseek_image｜>` in message text is rejected (HTTP 400) instead of rendered as an image placeholder with no
+image. The checkpoint's reference encoder (`encoding/encoding.py`) applies the same rule.
+
+`parser_deepseek_v41.py` (mounted over `vllm/parser/deepseek_v41.py`), issue #12: J-M-Recipes' structural-closers
+overlay of the DeepSeek-V4.1 tool parser (Apache-2.0, vLLM's SPDX header; `J-M-Recipes/recipes` at `08650ec`, file
+`recipes/dgx-spark-4x/deepseek-v4.1-flash-vllm-tp4-sparknet/overlays/dsml-structural/vllm/parser/deepseek_v41.py`,
+sha256 `1c309d19...4da3ba`, unchanged; the same author's upstream PR is vLLM #66135, open). DSML has no escaping, so
+the stock parser cut a tool argument at any DSML closer inside it: the argument was dropped or truncated and streaming
+emitted unterminated JSON (9 of the 13 cases in #12, every streaming mode). The overlay treats `</parameter>` as the end
+of a value only when whitespace and a new parameter head, or the end of the arguments, follow it, and holds an
+`</invoke>` / `</calls>` met inside an open argument until what follows shows whether it is structure. Checked here:
+all 9 failing cases fixed in every mode, and byte-identical to the stock parser on the matrix's ordinary cases and on
+600 randomized ordinary tool-call outputs (1,210 calls; non-streamed and streamed in 1 / 3 / 7 / all-token chunks).
+Known limits (the overlay's own): a value holding `</parameter>` followed by whitespace and a new parameter head reads
+as two arguments, and a call cut by `max_tokens` still streams unterminated JSON. `VLLM_DSV41_STRUCTURAL_DSML=0`
+restores the stock parser.

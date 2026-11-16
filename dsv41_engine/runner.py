@@ -27,6 +27,53 @@ _PARAMS = ("temperature", "top_k", "top_p", "min_p", "seeds")
 # step grew it and the 1x5 graph's next replay read garbage (an out-of-range gather). Each growth bumps this
 # generation; a graph captured under an older one is retired and captured again on its next use.
 _WS_GEN = [0]
+# Issue #10: a replay step's sampled ids and counts live in the shared graph pool, which the next replay (of any
+# graph) reuses as scratch. vLLM copies them to the host on its output copy stream, ordered after their own replay
+# only, while the engine has already queued the next step: a late copy read the next forward's MXFP8 scale bytes
+# (0x72/0x73) as token ids. The copies now run on the main stream, between this replay and the next one
+# (DSV41_WS_OUTPUT_FENCE=0 restores the old ordering, for timing only), and the host checks what it reads before the
+# scheduler sees it: 0 <= num_sampled <= drafts + 1, ids below the vocabulary (DSV41_WS_OUTPUT_CHECK = raise, the
+# default: stop the engine instead of serving garbage; log: report and go on; 0: off).
+_WS_OUTPUT_FENCE = os.environ.get("DSV41_WS_OUTPUT_FENCE", "1") != "0"
+_WS_OUTPUT_CHECK = os.environ.get("DSV41_WS_OUTPUT_CHECK", "raise")
+_CHECKED_OUTPUT = []
+
+
+def _checked_output_cls():
+    """vLLM's AsyncOutput with a host-side check of the copied ids and counts in get_output (replay steps)."""
+    if _CHECKED_OUTPUT:
+        return _CHECKED_OUTPUT[0]
+    from vllm.v1.worker.gpu.model_runner import AsyncOutput
+
+    class ReplayOutput(AsyncOutput):
+        def __init__(self, *args, ws_max_tokens, ws_vocab, ws_key, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._ws_max_tokens, self._ws_vocab, self._ws_key = ws_max_tokens, ws_vocab, ws_key
+
+        def get_output(self):
+            if _WS_OUTPUT_CHECK != "0":
+                self.copy_event.synchronize()
+                n = np.asarray(self.num_sampled_tokens_np).astype(np.int64).reshape(-1)
+                ids = np.asarray(self.sampled_token_ids).astype(np.int64)
+                ids = ids.reshape(ids.shape[0], -1)
+                ok_n = (n >= 0) & (n <= self._ws_max_tokens)
+                live = np.arange(ids.shape[1])[None, :] < np.clip(n, 0, ids.shape[1])[:, None]
+                bad = live & ((ids < 0) | (ids >= self._ws_vocab))
+                rows = np.nonzero(~ok_n | bad.any(axis=1))[0]
+                if len(rows):
+                    detail = "; ".join(f"row {r}: num_sampled {int(n[r])}, ids "
+                                       + " ".join(hex(int(v) & 0xFFFFFFFFFFFFFFFF) for v in ids[r, :max(1, min(int(n[r]), 4))])
+                                       for r in rows[:4])
+                    msg = (f"output check FAILED on a replay of {self._ws_key}: {len(rows)} of {len(n)} rows invalid "
+                           f"(num_sampled outside 0..{self._ws_max_tokens} or ids outside 0..{self._ws_vocab - 1}): "
+                           f"{detail}")
+                    _LOG(msg)
+                    if _WS_OUTPUT_CHECK == "raise":
+                        raise RuntimeError(f"DSV41_WHOLE_STEP {msg}")
+            return super().get_output()
+
+    _CHECKED_OUTPUT.append(ReplayOutput)
+    return ReplayOutput
 
 
 def _install_workspace_hook():
@@ -588,9 +635,13 @@ class WholeStepRunner(GPUModelRunner):
                                 kv_connector_output=kvo)
         h = self.draft_tokens_handler   # the scheduler gets placeholder drafts (no structured output here)
         h.req_ids, h.num_draft_tokens, h.draft_tokens_np = req_ids, K, None
-        return AsyncOutput(model_runner_output=mro, sampler_output=g.sampler_output, num_sampled_tokens=g.num_sampled,
-                           main_stream=self.main_stream, copy_stream=self.output_copy_stream,
-                           check_ep_fault=self.check_ep_fault, pending_aux_output=None)
+        # #10: copy on the main stream (before the next replay reuses the pool), then check on the host
+        return _checked_output_cls()(
+            model_runner_output=mro, sampler_output=g.sampler_output, num_sampled_tokens=g.num_sampled,
+            main_stream=self.main_stream,
+            copy_stream=self.main_stream if _WS_OUTPUT_FENCE else self.output_copy_stream,
+            check_ep_fault=self.check_ep_fault, pending_aux_output=None,
+            ws_max_tokens=K + 1, ws_vocab=self.vocab_size, ws_key=f"{len(req_ids)}x{K}")
 
     # ----------------------------------------------------------------------------------- capture and refresh
     def _ws_consts(self, slots, K):
